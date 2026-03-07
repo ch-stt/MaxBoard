@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MaxBoard</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="top-left">
+        <button id="course-btn" class="btn primary"></button>
+        <button id="prev-wb-btn" class="btn">◀</button>
+        <button id="next-wb-btn" class="btn">▶</button>
+      </div>
+      <div class="top-center" id="teacher-tools">
+        <button class="btn tool tool-btn active" data-tool="pen" title="Stylo" aria-label="Stylo">
+          <span class="tool-icon">✏</span>
+        </button>
+        <button class="btn tool tool-btn" data-tool="watercolor" title="Aquarelle" aria-label="Aquarelle">
+          <span class="tool-icon">🖌</span>
+        </button>
+        <button class="btn tool tool-btn" data-tool="eraser" title="Gomme" aria-label="Gomme">
+          <span class="tool-icon">⌫</span>
+        </button>
+        <button class="btn tool tool-btn" data-tool="image" title="Images" aria-label="Images">
+          <span class="tool-icon">🖼</span>
+        </button>
+        <button class="btn tool tool-btn" data-tool="hotspot" title="Hotspots" aria-label="Hotspots">
+          <span class="tool-icon">⚙</span>
+        </button>
+        <input id="color-input" type="color" value="#1a1a1a" title="Couleur" />
+        <div id="color-presets" class="color-chip-list color-chip-inline">
+          <button class="color-chip active" data-color="#1a1a1a" title="Noir" aria-label="Noir"></button>
+          <button class="color-chip" data-color="#e53935" title="Rouge" aria-label="Rouge"></button>
+          <button class="color-chip" data-color="#43a047" title="Vert" aria-label="Vert"></button>
+          <button class="color-chip" data-color="#1e88e5" title="Bleu" aria-label="Bleu"></button>
+          <button class="color-chip" data-color="#fdd835" title="Jaune" aria-label="Jaune"></button>
+          <button class="color-chip" data-color="#fb8c00" title="Orange" aria-label="Orange"></button>
+          <button class="color-chip" data-color="#ffffff" title="Blanc" aria-label="Blanc"></button>
+        </div>
+        <input id="size-input" type="range" min="1" max="24" value="3" />
+        <button id="undo-btn" class="btn">Undo</button>
+        <button id="clear-btn" class="btn danger">Clear</button>
+      </div>
+      <div class="top-right">
+        <button id="zoom-out-btn" class="btn">-</button>
+        <span id="zoom-label" class="pill">100%</span>
+        <button id="zoom-in-btn" class="btn">+</button>
+        <button id="burger-btn" class="btn">☰</button>
+      </div>
+    </header>
+
+    <aside id="burger-menu" class="menu hidden">
+      <button id="share-student-btn" class="menu-item">QR Etudiants</button>
+      <button id="share-teacher-btn" class="menu-item">QR Prof distant</button>
+      <button id="export-png-btn" class="menu-item">Export PNG</button>
+      <button id="export-pdf-btn" class="menu-item">Export PDF</button>
+      <button id="reset-view-btn" class="menu-item">Reset zoom</button>
+    </aside>
+
+    <main id="stage-wrap">
+      <div id="board-stage">
+        <div id="wb-title" class="board-title"></div>
+        <canvas id="board-canvas" width="1600" height="900"></canvas>
+        <div id="hotspot-layer"></div>
+        <div id="image-actions" class="image-actions hidden">
+          <button id="image-duplicate-btn" class="img-action-btn" title="Dupliquer">⧉</button>
+          <button id="image-delete-btn" class="img-action-btn danger" title="Supprimer">🗑</button>
+        </div>
+      </div>
+    </main>
+
+    <dialog id="course-dialog" class="dialog wide">
+      <h3>Gestion des cours</h3>
+      <div class="dialog-grid">
+        <section>
+          <h4>Cours</h4>
+          <div id="course-list" class="list"></div>
+          <div class="actions">
+            <button id="course-create-btn" class="btn">Creer</button>
+            <button id="course-rename-btn" class="btn">Renommer</button>
+            <button id="course-duplicate-btn" class="btn">Dupliquer</button>
+            <button id="course-delete-btn" class="btn danger">Supprimer</button>
+          </div>
+        </section>
+        <section>
+          <h4>Whiteboards</h4>
+          <div id="wb-list" class="list"></div>
+          <div class="actions">
+            <button id="wb-create-btn" class="btn">Creer</button>
+            <button id="wb-rename-btn" class="btn">Renommer</button>
+            <button id="wb-duplicate-btn" class="btn">Dupliquer</button>
+            <button id="wb-delete-btn" class="btn danger">Supprimer</button>
+          </div>
+        </section>
+      </div>
+      <form method="dialog" class="dialog-foot">
+        <button class="btn">Fermer</button>
+      </form>
+    </dialog>
+
+    <dialog id="hotspot-dialog" class="dialog">
+      <h3 id="hotspot-title">Hotspot</h3>
+      <label>Titre <input id="hotspot-name" type="text" /></label>
+      <label>Couleur <input id="hotspot-color" type="color" value="#f39c12" /></label>
+      <label>Contenu HTML
+        <textarea id="hotspot-html" rows="10"></textarea>
+      </label>
+      <div class="actions">
+        <button id="hotspot-save-btn" class="btn primary">Sauver</button>
+        <button id="hotspot-delete-btn" class="btn danger">Supprimer</button>
+        <button id="hotspot-cancel-btn" class="btn">Annuler</button>
+      </div>
+    </dialog>
+
+    <dialog id="content-dialog" class="dialog">
+      <h3 id="content-title">Hotspot</h3>
+      <article id="content-html" class="content-html"></article>
+      <form method="dialog" class="dialog-foot">
+        <button class="btn">Fermer</button>
+      </form>
+    </dialog>
+
+    <dialog id="share-dialog" class="dialog">
+      <h3 id="share-title">Partage</h3>
+      <label>URL
+        <input id="share-url" type="text" readonly />
+      </label>
+      <img id="share-qr" alt="QR Code" class="qr" />
+      <div class="actions">
+        <button id="share-copy-btn" class="btn">Copier URL</button>
+        <button id="share-close-btn" class="btn">Fermer</button>
+      </div>
+    </dialog>
+
+    <div id="status" class="status"></div>
+    <script src="/assets/app.js"></script>
+  </body>
+  </html>

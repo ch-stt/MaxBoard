@@ -1,0 +1,1110 @@
+(() => {
+  const params = new URLSearchParams(location.search);
+  const mode = params.get("mode") === "student" ? "student" : "teacher";
+  const isTeacher = mode === "teacher";
+  const clientId = "c_" + Math.random().toString(36).slice(2, 10);
+  const logical = { w: 1600, h: 900 };
+
+  const els = {
+    courseBtn: document.getElementById("course-btn"),
+    prevWbBtn: document.getElementById("prev-wb-btn"),
+    nextWbBtn: document.getElementById("next-wb-btn"),
+    wbTitle: document.getElementById("wb-title"),
+    teacherTools: document.getElementById("teacher-tools"),
+    colorInput: document.getElementById("color-input"),
+    colorPresets: document.getElementById("color-presets"),
+    sizeInput: document.getElementById("size-input"),
+    undoBtn: document.getElementById("undo-btn"),
+    clearBtn: document.getElementById("clear-btn"),
+    zoomOutBtn: document.getElementById("zoom-out-btn"),
+    zoomInBtn: document.getElementById("zoom-in-btn"),
+    zoomLabel: document.getElementById("zoom-label"),
+    burgerBtn: document.getElementById("burger-btn"),
+    burgerMenu: document.getElementById("burger-menu"),
+    shareStudentBtn: document.getElementById("share-student-btn"),
+    shareTeacherBtn: document.getElementById("share-teacher-btn"),
+    exportPngBtn: document.getElementById("export-png-btn"),
+    exportPdfBtn: document.getElementById("export-pdf-btn"),
+    resetViewBtn: document.getElementById("reset-view-btn"),
+    stage: document.getElementById("board-stage"),
+    canvas: document.getElementById("board-canvas"),
+    hotspotLayer: document.getElementById("hotspot-layer"),
+    imageActions: document.getElementById("image-actions"),
+    imageDuplicateBtn: document.getElementById("image-duplicate-btn"),
+    imageDeleteBtn: document.getElementById("image-delete-btn"),
+    courseDialog: document.getElementById("course-dialog"),
+    courseList: document.getElementById("course-list"),
+    wbList: document.getElementById("wb-list"),
+    courseCreateBtn: document.getElementById("course-create-btn"),
+    courseRenameBtn: document.getElementById("course-rename-btn"),
+    courseDuplicateBtn: document.getElementById("course-duplicate-btn"),
+    courseDeleteBtn: document.getElementById("course-delete-btn"),
+    wbCreateBtn: document.getElementById("wb-create-btn"),
+    wbRenameBtn: document.getElementById("wb-rename-btn"),
+    wbDuplicateBtn: document.getElementById("wb-duplicate-btn"),
+    wbDeleteBtn: document.getElementById("wb-delete-btn"),
+    hotspotDialog: document.getElementById("hotspot-dialog"),
+    hotspotTitle: document.getElementById("hotspot-title"),
+    hotspotName: document.getElementById("hotspot-name"),
+    hotspotColor: document.getElementById("hotspot-color"),
+    hotspotHtml: document.getElementById("hotspot-html"),
+    hotspotSaveBtn: document.getElementById("hotspot-save-btn"),
+    hotspotDeleteBtn: document.getElementById("hotspot-delete-btn"),
+    hotspotCancelBtn: document.getElementById("hotspot-cancel-btn"),
+    contentDialog: document.getElementById("content-dialog"),
+    contentTitle: document.getElementById("content-title"),
+    contentHtml: document.getElementById("content-html"),
+    shareDialog: document.getElementById("share-dialog"),
+    shareTitle: document.getElementById("share-title"),
+    shareUrl: document.getElementById("share-url"),
+    shareQr: document.getElementById("share-qr"),
+    shareCopyBtn: document.getElementById("share-copy-btn"),
+    shareCloseBtn: document.getElementById("share-close-btn"),
+    status: document.getElementById("status"),
+  };
+
+  const state = {
+    shareBaseUrl: location.origin,
+    catalog: null,
+    activeBoard: null,
+    ws: null,
+    users: 0,
+    tool: "pen",
+    color: "#1a1a1a",
+    size: 3,
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    drawing: false,
+    drawPoints: [],
+    panning: false,
+    panStart: null,
+    selectedImageId: null,
+    imageDrag: null,
+    selectedCourseId: null,
+    selectedWbId: null,
+    editingHotspot: null,
+    pinch: null,
+    imageCache: {},
+  };
+
+  function setStatus(msg) {
+    const roleTxt = isTeacher ? "Prof" : "Consultation";
+    const wb = state.activeBoard ? state.activeBoard.name : "-";
+    els.status.textContent = `${roleTxt} | ${state.users} connectés | ${wb} | ${msg}`;
+  }
+
+  function refreshPresetColorUI() {
+    const chips = els.colorPresets ? els.colorPresets.querySelectorAll(".color-chip") : [];
+    chips.forEach((chip) => {
+      const c = String(chip.dataset.color || "").toLowerCase();
+      const active = c === String(state.color || "").toLowerCase();
+      chip.classList.toggle("active", active);
+      chip.style.background = c || "#1a1a1a";
+    });
+  }
+
+  function api(path, opts = {}) {
+    return fetch(path, {
+      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      ...opts,
+    }).then(async (r) => {
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(txt || `HTTP ${r.status}`);
+      }
+      const ctype = r.headers.get("content-type") || "";
+      if (ctype.includes("application/json")) return r.json();
+      return r.blob();
+    });
+  }
+
+  function activeCourse() {
+    if (!state.catalog) return null;
+    return state.catalog.courses.find((c) => c.id === state.catalog.activeCourseId) || null;
+  }
+
+  function boardSummary(id) {
+    return (state.catalog && state.catalog.whiteboards && state.catalog.whiteboards[id]) || null;
+  }
+
+  function wbOrder() {
+    const c = activeCourse();
+    return c ? c.whiteboardOrder || [] : [];
+  }
+
+  function makeId(prefix) {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  }
+
+  function chooseTool(tool) {
+    state.tool = tool;
+    if (tool !== "image") {
+      state.selectedImageId = null;
+      state.imageDrag = null;
+    }
+    document.querySelectorAll(".tool").forEach((b) => {
+      b.classList.toggle("active", b.dataset.tool === tool);
+    });
+    renderHotspots();
+    render();
+  }
+
+  function resizeCanvas() {
+    const rect = els.stage.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    els.canvas.width = Math.max(1, Math.floor(rect.width * devicePixelRatio));
+    els.canvas.height = Math.max(1, Math.floor(rect.height * devicePixelRatio));
+    render();
+  }
+
+  function toScreen(nx, ny) {
+    const w = els.canvas.width;
+    const h = els.canvas.height;
+    return {
+      x: nx * w * state.zoom + state.panX,
+      y: ny * h * state.zoom + state.panY,
+    };
+  }
+
+  function fromEvent(ev) {
+    const rect = els.canvas.getBoundingClientRect();
+    const cx = (ev.clientX - rect.left) * devicePixelRatio;
+    const cy = (ev.clientY - rect.top) * devicePixelRatio;
+    const nx = (cx - state.panX) / Math.max(1, els.canvas.width * state.zoom);
+    const ny = (cy - state.panY) / Math.max(1, els.canvas.height * state.zoom);
+    return {
+      x: Math.min(1, Math.max(0, nx)),
+      y: Math.min(1, Math.max(0, ny)),
+    };
+  }
+
+  function drawStroke(ctx, s) {
+    if (!s || !Array.isArray(s.points) || s.points.length < 1) return;
+    if (s.tool === "watercolor") {
+      drawWatercolorStroke(ctx, s);
+      return;
+    }
+    ctx.save();
+    ctx.globalCompositeOperation = s.tool === "eraser" ? "destination-out" : "source-over";
+    ctx.strokeStyle = s.color || "#1a1a1a";
+    ctx.lineWidth = Math.max(1, Number(s.size || 2) * state.zoom * devicePixelRatio);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const p0 = toScreen(s.points[0].x, s.points[0].y);
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    for (let i = 1; i < s.points.length; i++) {
+      const p = toScreen(s.points[i].x, s.points[i].y);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawWatercolorStroke(ctx, s) {
+    const points = Array.isArray(s.points) ? s.points : [];
+    if (points.length < 1) return;
+    const passes = [
+      { mul: 2.8, alpha: 0.08 },
+      { mul: 1.9, alpha: 0.12 },
+      { mul: 1.2, alpha: 0.16 },
+    ];
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = s.color || "#1a1a1a";
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    passes.forEach((p) => {
+      ctx.globalAlpha = p.alpha;
+      ctx.lineWidth = Math.max(1, Number(s.size || 2) * p.mul * state.zoom * devicePixelRatio);
+      const p0 = toScreen(points[0].x, points[0].y);
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      for (let i = 1; i < points.length; i++) {
+        const pt = toScreen(points[i].x, points[i].y);
+        ctx.lineTo(pt.x, pt.y);
+      }
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  function drawImageItem(ctx, item, isSelected) {
+    if (!item || !item.src) return;
+    if (!state.imageCache[item.src]) {
+      const img = new Image();
+      img.onload = () => render();
+      img.src = item.src;
+      state.imageCache[item.src] = img;
+    }
+    const img = state.imageCache[item.src];
+    if (!img || !img.complete) return;
+    const topLeft = toScreen(item.x || 0, item.y || 0);
+    const w = (item.w || 0.2) * els.canvas.width * state.zoom;
+    const h = (item.h || 0.2) * els.canvas.height * state.zoom;
+    ctx.drawImage(img, topLeft.x, topLeft.y, w, h);
+    if (!isSelected) return;
+    ctx.save();
+    ctx.strokeStyle = "#2f6feb";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(topLeft.x, topLeft.y, w, h);
+    const hs = 8;
+    ctx.fillStyle = "#2f6feb";
+    ctx.fillRect(topLeft.x + w - hs / 2, topLeft.y + h - hs / 2, hs, hs);
+    ctx.restore();
+  }
+
+  function updateImageActionsOverlay() {
+    if (!isTeacher || state.tool !== "image" || !state.activeBoard || !state.selectedImageId) {
+      els.imageActions.classList.add("hidden");
+      return;
+    }
+    const item = (state.activeBoard.images || []).find((it) => it.id === state.selectedImageId);
+    if (!item) {
+      els.imageActions.classList.add("hidden");
+      return;
+    }
+    const p = toScreen(item.x || 0, item.y || 0);
+    const w = (item.w || 0.2) * els.canvas.width * state.zoom;
+    const leftPx = (p.x + w + 8) / devicePixelRatio;
+    const topPx = p.y / devicePixelRatio;
+    els.imageActions.style.left = `${leftPx}px`;
+    els.imageActions.style.top = `${topPx}px`;
+    els.imageActions.classList.remove("hidden");
+  }
+
+  function imageHitTest(nx, ny) {
+    const images = state.activeBoard ? state.activeBoard.images || [] : [];
+    const handlePx = 14;
+    const handleN = handlePx / Math.max(1, els.canvas.width * state.zoom);
+    for (let i = images.length - 1; i >= 0; i--) {
+      const it = images[i];
+      const x = Number(it.x) || 0;
+      const y = Number(it.y) || 0;
+      const w = Number(it.w) || 0.2;
+      const h = Number(it.h) || 0.2;
+      if (nx < x || ny < y || nx > x + w || ny > y + h) continue;
+      const nearResize = nx >= (x + w - handleN) && ny >= (y + h - handleN);
+      return { item: it, mode: nearResize ? "resize" : "move" };
+    }
+    return null;
+  }
+
+  function clampImageBounds(item) {
+    item.w = Math.max(0.03, Math.min(1, Number(item.w) || 0.2));
+    item.h = Math.max(0.03, Math.min(1, Number(item.h) || 0.2));
+    item.x = Math.max(0, Math.min(1 - item.w, Number(item.x) || 0));
+    item.y = Math.max(0, Math.min(1 - item.h, Number(item.y) || 0));
+  }
+
+  function renderHotspots() {
+    const layer = els.hotspotLayer;
+    layer.innerHTML = "";
+    if (!state.activeBoard || !Array.isArray(state.activeBoard.hotspots)) return;
+    state.activeBoard.hotspots.forEach((h) => {
+      const p = toScreen(Number(h.x || 0.5), Number(h.y || 0.5));
+      const btn = document.createElement("button");
+      btn.className = "hotspot " + (isTeacher ? "gear" : "viewer");
+      btn.style.background = h.color || "#f39c12";
+      btn.style.left = `${p.x / devicePixelRatio}px`;
+      btn.style.top = `${p.y / devicePixelRatio}px`;
+      btn.title = h.title || "Hotspot";
+      btn.onpointerdown = (ev) => {
+        ev.stopPropagation();
+        if (!(isTeacher && state.tool === "hotspot") || ev.button !== 0) return;
+        ev.preventDefault();
+        const startX = ev.clientX;
+        const startY = ev.clientY;
+        let moved = false;
+
+        const onMove = (mv) => {
+          const dist = Math.hypot(mv.clientX - startX, mv.clientY - startY);
+          if (dist > 3) moved = true;
+          if (!moved) return;
+          const np = fromEvent(mv);
+          h.x = np.x;
+          h.y = np.y;
+          const sp = toScreen(h.x, h.y);
+          btn.style.left = `${sp.x / devicePixelRatio}px`;
+          btn.style.top = `${sp.y / devicePixelRatio}px`;
+        };
+
+        const onUp = () => {
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+          window.removeEventListener("pointercancel", onUp);
+          if (moved) {
+            send({ type: "hotspot_upsert", hotspot: h });
+            render();
+            return;
+          }
+          openHotspotEditor(h);
+        };
+
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        window.addEventListener("pointercancel", onUp);
+      };
+      btn.onclick = () => {
+        if (isTeacher && state.tool === "hotspot") return;
+        openHotspotContent(h);
+      };
+      layer.appendChild(btn);
+    });
+  }
+
+  function render() {
+    const ctx = els.canvas.getContext("2d");
+    ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+    if (!state.activeBoard) {
+      renderHotspots();
+      return;
+    }
+    (state.activeBoard.images || []).forEach((it) => drawImageItem(ctx, it, it.id === state.selectedImageId));
+    (state.activeBoard.strokes || []).forEach((s) => drawStroke(ctx, s));
+    if (state.drawing && state.drawPoints.length > 1) {
+      drawStroke(ctx, {
+        tool: state.tool,
+        color: state.color,
+        size: state.size,
+        points: state.drawPoints,
+      });
+    }
+    renderHotspots();
+    els.zoomLabel.textContent = `${Math.round(state.zoom * 100)}%`;
+    const c = activeCourse();
+    const wbName = state.activeBoard ? state.activeBoard.name : "";
+    els.wbTitle.textContent = `${c ? c.name : "-"} / ${wbName}`;
+    updateImageActionsOverlay();
+  }
+
+  function syncCatalog(catalog, activeBoard) {
+    state.catalog = catalog;
+    state.activeBoard = activeBoard;
+    if (!state.selectedCourseId) state.selectedCourseId = catalog.activeCourseId;
+    if (!state.selectedWbId) state.selectedWbId = catalog.activeWhiteboardId;
+    const c = activeCourse();
+    els.courseBtn.textContent = c ? `Cours: ${c.name}` : "Cours";
+    renderCourseDialog();
+    render();
+    setStatus("Synchronisé");
+  }
+
+  function connectWs() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws/live?role=${isTeacher ? "teacher" : "student"}`);
+    state.ws = ws;
+    ws.onopen = () => setStatus("Connecté");
+    ws.onclose = () => {
+      setStatus("Déconnecté - reconnexion...");
+      setTimeout(connectWs, 900);
+    };
+    ws.onerror = () => setStatus("Erreur websocket");
+    ws.onmessage = (ev) => {
+      let msg = null;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (_err) {
+        return;
+      }
+      if (msg.type === "init") {
+        state.users = Number(msg.users || 0);
+        syncCatalog(msg.state, msg.activeBoard);
+        return;
+      }
+      if (msg.type === "users") {
+        state.users = Number(msg.count || 0);
+        setStatus("Connecté");
+        return;
+      }
+      if (msg.type === "catalog") {
+        syncCatalog(msg.state, msg.activeBoard);
+        return;
+      }
+      if (msg.sender && msg.sender === clientId) return;
+      if (!state.activeBoard) return;
+
+      if (msg.type === "stroke" && msg.stroke) {
+        state.activeBoard.strokes.push(msg.stroke);
+        render();
+        return;
+      }
+      if (msg.type === "clear") {
+        state.activeBoard.strokes = [];
+        state.activeBoard.images = [];
+        state.selectedImageId = null;
+        render();
+        return;
+      }
+      if (msg.type === "image_add" && msg.image) {
+        state.activeBoard.images.push(msg.image);
+        render();
+        return;
+      }
+      if (msg.type === "image_update") {
+        state.activeBoard.images = (state.activeBoard.images || []).map((it) =>
+          it.id === msg.id ? { ...it, x: msg.x, y: msg.y, w: msg.w, h: msg.h } : it
+        );
+        render();
+        return;
+      }
+      if (msg.type === "image_delete") {
+        state.activeBoard.images = (state.activeBoard.images || []).filter((it) => it.id !== msg.id);
+        if (state.selectedImageId === msg.id) state.selectedImageId = null;
+        render();
+        return;
+      }
+      if (msg.type === "hotspot_upsert" && msg.hotspot) {
+        const hs = msg.hotspot;
+        let found = false;
+        state.activeBoard.hotspots = (state.activeBoard.hotspots || []).map((h) => {
+          if (h.id === hs.id) {
+            found = true;
+            return hs;
+          }
+          return h;
+        });
+        if (!found) state.activeBoard.hotspots.push(hs);
+        render();
+        return;
+      }
+      if (msg.type === "hotspot_delete") {
+        state.activeBoard.hotspots = (state.activeBoard.hotspots || []).filter((h) => h.id !== msg.id);
+        render();
+        return;
+      }
+      if (msg.type === "active_board_sync" && msg.board) {
+        state.activeBoard = msg.board;
+        if (!(state.activeBoard.images || []).some((it) => it.id === state.selectedImageId)) {
+          state.selectedImageId = null;
+        }
+        render();
+      }
+    };
+  }
+
+  function send(msg) {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ ...msg, sender: clientId }));
+    return true;
+  }
+
+  function activateWhiteboard(id) {
+    send({ type: "activate_whiteboard", whiteboardId: id });
+  }
+
+  function openHotspotEditor(h) {
+    if (!isTeacher) return;
+    state.editingHotspot = { ...h };
+    els.hotspotTitle.textContent = "Editer hotspot";
+    els.hotspotName.value = h.title || "";
+    els.hotspotColor.value = h.color || "#f39c12";
+    els.hotspotHtml.value = h.html || "";
+    els.hotspotDialog.showModal();
+  }
+
+  function openHotspotContent(h) {
+    els.contentTitle.textContent = h.title || "Hotspot";
+    els.contentTitle.classList.add("hotspot-content-title");
+    els.contentTitle.style.background = h.color || "#2f6feb";
+    els.contentHtml.innerHTML = h.html || "<p>(vide)</p>";
+    els.contentDialog.showModal();
+  }
+
+  function openShare(kind) {
+    const url =
+      kind === "student"
+        ? `${state.shareBaseUrl}/?mode=student`
+        : `${state.shareBaseUrl}/?mode=teacher&remote=1`;
+    els.shareTitle.textContent = kind === "student" ? "QR consultation etudiants" : "QR edition prof";
+    els.shareUrl.value = url;
+    els.shareQr.src = `/api/qr?url=${encodeURIComponent(url)}`;
+    els.shareDialog.showModal();
+  }
+
+  function orderedHotspotsForPdf() {
+    const hs = (state.activeBoard && state.activeBoard.hotspots) || [];
+    return [...hs].sort((a, b) => String(a.title || "").localeCompare(String(b.title || ""), "fr"));
+  }
+
+  function renderExportCanvas() {
+    const out = document.createElement("canvas");
+    out.width = logical.w;
+    out.height = logical.h;
+    const ctx = out.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, out.width, out.height);
+    (state.activeBoard.images || []).forEach((it) => {
+      if (!it.src || !state.imageCache[it.src] || !state.imageCache[it.src].complete) return;
+      ctx.drawImage(
+        state.imageCache[it.src],
+        (it.x || 0) * out.width,
+        (it.y || 0) * out.height,
+        (it.w || 0.2) * out.width,
+        (it.h || 0.2) * out.height
+      );
+    });
+    (state.activeBoard.strokes || []).forEach((s) => {
+      if (!s.points || !s.points.length) return;
+      if (s.tool === "watercolor") {
+        const passes = [
+          { mul: 2.8, alpha: 0.08 },
+          { mul: 1.9, alpha: 0.12 },
+          { mul: 1.2, alpha: 0.16 },
+        ];
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+        ctx.strokeStyle = s.color || "#1a1a1a";
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        passes.forEach((p) => {
+          ctx.globalAlpha = p.alpha;
+          ctx.lineWidth = Math.max(1, Number(s.size || 2) * p.mul);
+          ctx.beginPath();
+          ctx.moveTo(s.points[0].x * out.width, s.points[0].y * out.height);
+          for (let i = 1; i < s.points.length; i++) {
+            ctx.lineTo(s.points[i].x * out.width, s.points[i].y * out.height);
+          }
+          ctx.stroke();
+        });
+        ctx.restore();
+        return;
+      }
+      ctx.save();
+      ctx.globalCompositeOperation = s.tool === "eraser" ? "destination-out" : "source-over";
+      ctx.strokeStyle = s.color || "#1a1a1a";
+      ctx.lineWidth = Number(s.size || 2);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(s.points[0].x * out.width, s.points[0].y * out.height);
+      for (let i = 1; i < s.points.length; i++) {
+        ctx.lineTo(s.points[i].x * out.width, s.points[i].y * out.height);
+      }
+      ctx.stroke();
+      ctx.restore();
+    });
+    return out;
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportPng() {
+    if (!state.activeBoard) return;
+    const out = renderExportCanvas();
+    out.toBlob((blob) => {
+      if (!blob) return;
+      const name = `${state.activeBoard.name || "whiteboard"}.png`;
+      downloadBlob(blob, name);
+    }, "image/png");
+  }
+
+  async function exportPdf() {
+    if (!state.activeBoard || !state.catalog) return;
+    const c = activeCourse();
+    const out = renderExportCanvas();
+    const imageDataUrl = out.toDataURL("image/png");
+    const ordered = orderedHotspotsForPdf().map((h) => ({ title: h.title || "", html: h.html || "" }));
+    const blob = await api("/api/export/pdf", {
+      method: "POST",
+      body: JSON.stringify({
+        courseName: c ? c.name : "",
+        whiteboardName: state.activeBoard.name || "",
+        imageDataUrl,
+        hotspots: ordered,
+      }),
+    });
+    downloadBlob(blob, `${state.activeBoard.name || "whiteboard"}.pdf`);
+  }
+
+  function renderList(container, items, activeId, onClick, onDropReorder) {
+    container.innerHTML = "";
+    let dragId = null;
+    items.forEach((it) => {
+      const row = document.createElement("div");
+      row.className = "list-item" + (it.id === activeId ? " active" : "");
+      row.textContent = it.name;
+      row.draggable = isTeacher;
+      row.onclick = () => onClick(it);
+      row.ondragstart = () => {
+        dragId = it.id;
+      };
+      row.ondragover = (ev) => ev.preventDefault();
+      row.ondrop = (ev) => {
+        ev.preventDefault();
+        if (!dragId || dragId === it.id) return;
+        const ids = items.map((x) => x.id);
+        const a = ids.indexOf(dragId);
+        const b = ids.indexOf(it.id);
+        if (a < 0 || b < 0) return;
+        ids.splice(b, 0, ids.splice(a, 1)[0]);
+        onDropReorder(ids);
+      };
+      container.appendChild(row);
+    });
+  }
+
+  function renderCourseDialog() {
+    if (!state.catalog) return;
+    const courseItems = state.catalog.courses.map((c) => ({ id: c.id, name: c.name }));
+    renderList(
+      els.courseList,
+      courseItems,
+      state.catalog.activeCourseId,
+      (c) => {
+        state.selectedCourseId = c.id;
+        api(`/api/courses/${c.id}/activate`, { method: "POST" }).catch((e) => alert(e.message));
+      },
+      (ids) => api("/api/courses/reorder", { method: "POST", body: JSON.stringify({ courseIds: ids }) }).catch((e) => alert(e.message))
+    );
+
+    const c = state.catalog.courses.find((x) => x.id === (state.selectedCourseId || state.catalog.activeCourseId));
+    const wbIds = c ? c.whiteboardOrder || [] : [];
+    const wbItems = wbIds
+      .map((id) => boardSummary(id))
+      .filter(Boolean)
+      .map((b) => ({ id: b.id, name: b.name }));
+    renderList(
+      els.wbList,
+      wbItems,
+      state.catalog.activeWhiteboardId,
+      (wb) => {
+        state.selectedWbId = wb.id;
+        activateWhiteboard(wb.id);
+      },
+      (ids) =>
+        c
+          ? api(`/api/courses/${c.id}/whiteboards/reorder`, {
+              method: "POST",
+              body: JSON.stringify({ whiteboardIds: ids }),
+            }).catch((e) => alert(e.message))
+          : null
+    );
+  }
+
+  function setTeacherVisibility() {
+    if (isTeacher) return;
+    els.courseBtn.classList.add("hidden");
+    els.prevWbBtn.classList.add("hidden");
+    els.nextWbBtn.classList.add("hidden");
+    els.teacherTools.classList.add("hidden");
+    els.shareTeacherBtn.classList.add("hidden");
+  }
+
+  function setupEvents() {
+    document.querySelectorAll(".tool").forEach((b) => (b.onclick = () => chooseTool(b.dataset.tool)));
+    els.colorInput.oninput = () => {
+      state.color = String(els.colorInput.value || "#1a1a1a").toLowerCase();
+      refreshPresetColorUI();
+    };
+    if (els.colorPresets) {
+      els.colorPresets.querySelectorAll(".color-chip").forEach((chip) => {
+        chip.style.background = chip.dataset.color || "#1a1a1a";
+        chip.onclick = () => {
+          const c = String(chip.dataset.color || "#1a1a1a").toLowerCase();
+          state.color = c;
+          els.colorInput.value = c;
+          refreshPresetColorUI();
+        };
+      });
+    }
+    els.sizeInput.oninput = () => {
+      state.size = Number(els.sizeInput.value || 3);
+    };
+    els.undoBtn.onclick = () => {
+      if (!state.activeBoard) return;
+      if ((state.activeBoard.strokes || []).length > 0) {
+        state.activeBoard.strokes.pop();
+        render();
+      }
+      send({ type: "undo_stroke" });
+    };
+    els.clearBtn.onclick = () => {
+      if (!confirm("Effacer completement ce whiteboard ?")) return;
+      if (state.activeBoard) {
+        state.activeBoard.strokes = [];
+        state.activeBoard.images = [];
+        state.selectedImageId = null;
+        render();
+      }
+      send({ type: "clear" });
+    };
+    els.imageDeleteBtn.onclick = () => {
+      if (!state.activeBoard || !state.selectedImageId) return;
+      const id = state.selectedImageId;
+      state.activeBoard.images = (state.activeBoard.images || []).filter((it) => it.id !== id);
+      state.selectedImageId = null;
+      render();
+      send({ type: "image_delete", id });
+    };
+    els.imageDuplicateBtn.onclick = () => {
+      if (!state.activeBoard || !state.selectedImageId) return;
+      const src = (state.activeBoard.images || []).find((it) => it.id === state.selectedImageId);
+      if (!src) return;
+      const dup = {
+        ...src,
+        id: makeId("img"),
+        x: Math.min(0.94, (Number(src.x) || 0) + 0.03),
+        y: Math.min(0.94, (Number(src.y) || 0) + 0.03),
+      };
+      clampImageBounds(dup);
+      state.activeBoard.images.push(dup);
+      state.selectedImageId = dup.id;
+      render();
+      send({ type: "image_add", image: dup });
+    };
+    els.zoomInBtn.onclick = () => {
+      state.zoom = Math.min(3, state.zoom + 0.1);
+      render();
+    };
+    els.zoomOutBtn.onclick = () => {
+      state.zoom = Math.max(0.4, state.zoom - 0.1);
+      render();
+    };
+    els.resetViewBtn.onclick = () => {
+      state.zoom = 1;
+      state.panX = 0;
+      state.panY = 0;
+      render();
+      els.burgerMenu.classList.add("hidden");
+    };
+    els.burgerBtn.onclick = () => {
+      els.burgerMenu.classList.toggle("hidden");
+    };
+    document.addEventListener("click", (e) => {
+      const t = e.target;
+      if (!els.burgerMenu.contains(t) && t !== els.burgerBtn) {
+        els.burgerMenu.classList.add("hidden");
+      }
+    });
+    els.shareStudentBtn.onclick = () => openShare("student");
+    els.shareTeacherBtn.onclick = () => openShare("teacher");
+    els.exportPngBtn.onclick = () => exportPng();
+    els.exportPdfBtn.onclick = () => exportPdf().catch((e) => alert(e.message));
+    els.shareCopyBtn.onclick = async () => {
+      await navigator.clipboard.writeText(els.shareUrl.value);
+      setStatus("URL copiée");
+    };
+    els.shareCloseBtn.onclick = () => els.shareDialog.close();
+    els.courseBtn.onclick = () => {
+      renderCourseDialog();
+      els.courseDialog.showModal();
+    };
+
+    els.prevWbBtn.onclick = () => {
+      const order = wbOrder();
+      if (!order.length) return;
+      const i = order.indexOf(state.catalog.activeWhiteboardId);
+      const prev = i <= 0 ? order[order.length - 1] : order[i - 1];
+      activateWhiteboard(prev);
+    };
+    els.nextWbBtn.onclick = () => {
+      const order = wbOrder();
+      if (!order.length) return;
+      const i = order.indexOf(state.catalog.activeWhiteboardId);
+      const next = i < 0 || i >= order.length - 1 ? order[0] : order[i + 1];
+      activateWhiteboard(next);
+    };
+
+    els.courseCreateBtn.onclick = async () => {
+      const name = prompt("Nom du cours ?", "Nouveau cours");
+      if (!name) return;
+      await api("/api/courses", { method: "POST", body: JSON.stringify({ name }) });
+    };
+    els.courseRenameBtn.onclick = async () => {
+      const id = state.catalog.activeCourseId;
+      const c = activeCourse();
+      if (!c) return;
+      const name = prompt("Nouveau nom du cours ?", c.name);
+      if (!name) return;
+      await api(`/api/courses/${id}`, { method: "PATCH", body: JSON.stringify({ name }) });
+    };
+    els.courseDuplicateBtn.onclick = async () => {
+      const id = state.catalog.activeCourseId;
+      await api(`/api/courses/${id}/duplicate`, { method: "POST" });
+    };
+    els.courseDeleteBtn.onclick = async () => {
+      const id = state.catalog.activeCourseId;
+      if (!confirm("Suppression definitive du cours et de ses whiteboards ?")) return;
+      await api(`/api/courses/${id}`, { method: "DELETE" });
+    };
+
+    els.wbCreateBtn.onclick = async () => {
+      const c = activeCourse();
+      if (!c) return;
+      const name = prompt("Nom du whiteboard ?", "Nouveau whiteboard");
+      if (!name) return;
+      await api(`/api/courses/${c.id}/whiteboards`, { method: "POST", body: JSON.stringify({ name }) });
+    };
+    els.wbRenameBtn.onclick = async () => {
+      const wb = state.activeBoard;
+      if (!wb) return;
+      const name = prompt("Nouveau nom du whiteboard ?", wb.name);
+      if (!name) return;
+      await api(`/api/whiteboards/${wb.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
+    };
+    els.wbDuplicateBtn.onclick = async () => {
+      const wb = state.activeBoard;
+      if (!wb) return;
+      await api(`/api/whiteboards/${wb.id}/duplicate`, { method: "POST", body: JSON.stringify({}) });
+    };
+    els.wbDeleteBtn.onclick = async () => {
+      const wb = state.activeBoard;
+      if (!wb) return;
+      if (!confirm("Suppression definitive du whiteboard ?")) return;
+      await api(`/api/whiteboards/${wb.id}`, { method: "DELETE" });
+    };
+
+    els.hotspotCancelBtn.onclick = () => els.hotspotDialog.close();
+    els.hotspotSaveBtn.onclick = () => {
+      if (!state.editingHotspot) return;
+      const hs = {
+        ...state.editingHotspot,
+        title: els.hotspotName.value.trim() || "Hotspot",
+        color: els.hotspotColor.value,
+        html: els.hotspotHtml.value,
+      };
+      let found = false;
+      state.activeBoard.hotspots = (state.activeBoard.hotspots || []).map((item) => {
+        if (item.id === hs.id) {
+          found = true;
+          return hs;
+        }
+        return item;
+      });
+      if (!found) state.activeBoard.hotspots.push(hs);
+      render();
+      send({ type: "hotspot_upsert", hotspot: hs });
+      els.hotspotDialog.close();
+    };
+    els.hotspotDeleteBtn.onclick = () => {
+      if (!state.editingHotspot) return;
+      if (!confirm("Supprimer ce hotspot ?")) return;
+      state.activeBoard.hotspots = (state.activeBoard.hotspots || []).filter((h) => h.id !== state.editingHotspot.id);
+      render();
+      send({ type: "hotspot_delete", id: state.editingHotspot.id });
+      els.hotspotDialog.close();
+    };
+
+    let pointerId = null;
+    els.stage.addEventListener("pointerdown", (ev) => {
+      if (state.pinch) return;
+      if (ev.pointerType === "touch" && ev.isPrimary === false) return;
+      if (isTeacher && state.tool === "hotspot" && ev.button === 0) {
+        const p = fromEvent(ev);
+        const hs = {
+          id: "hs_" + Date.now(),
+          x: p.x,
+          y: p.y,
+          title: "Hotspot",
+          html: "<p>Contenu du hotspot</p>",
+          color: "#f39c12",
+        };
+        openHotspotEditor(hs);
+        return;
+      }
+      if (isTeacher && state.activeBoard && state.tool === "image" && ev.button === 0) {
+        const p = fromEvent(ev);
+        const hit = imageHitTest(p.x, p.y);
+        if (hit) {
+          state.selectedImageId = hit.item.id;
+          state.imageDrag = {
+            pointerId: ev.pointerId,
+            id: hit.item.id,
+            mode: hit.mode,
+            startX: p.x,
+            startY: p.y,
+            x: Number(hit.item.x) || 0,
+            y: Number(hit.item.y) || 0,
+            w: Number(hit.item.w) || 0.2,
+            h: Number(hit.item.h) || 0.2,
+          };
+          render();
+          return;
+        }
+        if (state.selectedImageId) {
+          state.selectedImageId = null;
+          render();
+          return;
+        }
+      }
+      if (!isTeacher || ev.altKey || ev.button === 1 || ev.button === 2) {
+        state.panning = true;
+        state.panStart = { x: ev.clientX, y: ev.clientY, panX: state.panX, panY: state.panY };
+        return;
+      }
+      if (state.tool !== "pen" && state.tool !== "eraser" && state.tool !== "watercolor") return;
+      pointerId = ev.pointerId;
+      state.drawing = true;
+      state.drawPoints = [fromEvent(ev)];
+      render();
+    });
+
+    els.stage.addEventListener("pointermove", (ev) => {
+      if (state.imageDrag && ev.pointerId === state.imageDrag.pointerId && state.activeBoard) {
+        const drag = state.imageDrag;
+        const p = fromEvent(ev);
+        const img = (state.activeBoard.images || []).find((it) => it.id === drag.id);
+        if (!img) return;
+        if (drag.mode === "move") {
+          img.x = drag.x + (p.x - drag.startX);
+          img.y = drag.y + (p.y - drag.startY);
+        } else {
+          img.w = drag.w + (p.x - drag.startX);
+          img.h = drag.h + (p.y - drag.startY);
+        }
+        clampImageBounds(img);
+        render();
+        send({ type: "image_update", id: img.id, x: img.x, y: img.y, w: img.w, h: img.h });
+        return;
+      }
+      if (state.panning && state.panStart) {
+        state.panX = state.panStart.panX + (ev.clientX - state.panStart.x) * devicePixelRatio;
+        state.panY = state.panStart.panY + (ev.clientY - state.panStart.y) * devicePixelRatio;
+        render();
+        return;
+      }
+      if (!state.drawing || ev.pointerId !== pointerId) return;
+      state.drawPoints.push(fromEvent(ev));
+      render();
+    });
+
+    const finishDraw = () => {
+      if (state.imageDrag) {
+        state.imageDrag = null;
+        return;
+      }
+      if (state.panning) {
+        state.panning = false;
+        state.panStart = null;
+        return;
+      }
+      if (!state.drawing) return;
+      state.drawing = false;
+      if (state.drawPoints.length > 1) {
+        const stroke = {
+          id: "s_" + Date.now(),
+          tool: state.tool,
+          color: state.color,
+          size: state.size,
+          points: state.drawPoints,
+        };
+        state.activeBoard.strokes.push(stroke);
+        send({ type: "stroke", stroke });
+      }
+      state.drawPoints = [];
+      render();
+    };
+    els.stage.addEventListener("pointerup", finishDraw);
+    els.stage.addEventListener("pointercancel", finishDraw);
+    els.stage.addEventListener("pointerleave", finishDraw);
+
+    els.stage.addEventListener(
+      "wheel",
+      (ev) => {
+        ev.preventDefault();
+        const before = state.zoom;
+        state.zoom = Math.max(0.4, Math.min(3, state.zoom + (ev.deltaY < 0 ? 0.08 : -0.08)));
+        if (before !== state.zoom) render();
+      },
+      { passive: false }
+    );
+
+    els.stage.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+    });
+
+    els.stage.addEventListener(
+      "touchstart",
+      (ev) => {
+        if (ev.touches.length === 2) {
+          const a = ev.touches[0];
+          const b = ev.touches[1];
+          const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+          state.pinch = { dist, zoom: state.zoom };
+        }
+      },
+      { passive: true }
+    );
+    els.stage.addEventListener(
+      "touchmove",
+      (ev) => {
+        if (ev.touches.length !== 2 || !state.pinch) return;
+        ev.preventDefault();
+        const a = ev.touches[0];
+        const b = ev.touches[1];
+        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+        const ratio = dist / Math.max(1, state.pinch.dist);
+        state.zoom = Math.max(0.4, Math.min(3, state.pinch.zoom * ratio));
+        render();
+      },
+      { passive: false }
+    );
+    els.stage.addEventListener("touchend", () => {
+      if (state.pinch) state.pinch = null;
+    });
+
+    window.addEventListener("resize", resizeCanvas);
+
+    window.addEventListener("paste", (ev) => {
+      if (!isTeacher || !state.activeBoard) return;
+      const tag = (document.activeElement && document.activeElement.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const items = ev.clipboardData && ev.clipboardData.items ? ev.clipboardData.items : [];
+      for (const item of items) {
+        if (!item.type || !item.type.startsWith("image/")) continue;
+        const file = item.getAsFile();
+        if (!file) continue;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const src = String(reader.result || "");
+          const image = {
+            id: makeId("img"),
+            src,
+            x: 0.35,
+            y: 0.3,
+            w: 0.3,
+            h: 0.3,
+          };
+          state.activeBoard.images.push(image);
+          state.selectedImageId = image.id;
+          send({ type: "image_add", image });
+          render();
+        };
+        reader.readAsDataURL(file);
+        ev.preventDefault();
+        break;
+      }
+    });
+  }
+
+  async function init() {
+    setTeacherVisibility();
+    setupEvents();
+    const data = await api("/api/bootstrap");
+    state.shareBaseUrl = data.shareBaseUrl || location.origin;
+    syncCatalog(data.state, data.activeBoard);
+    state.color = String(els.colorInput.value || "#1a1a1a").toLowerCase();
+    state.size = Number(els.sizeInput.value || 3);
+    refreshPresetColorUI();
+    resizeCanvas();
+    connectWs();
+    setStatus("Prêt");
+  }
+
+  init().catch((e) => {
+    console.error(e);
+    alert(String(e.message || e));
+  });
+})();
