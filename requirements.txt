@@ -3,3 +3,8 @@ uvicorn
 qrcode[pil]
 reportlab
 websockets
+python-multipart
+pypdf
+fastembed
+llama-cpp-python
+numpy

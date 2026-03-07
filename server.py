@@ -2,7 +2,10 @@
 import asyncio
 import copy
 import json
+import math
+import os
 import re
+import shutil
 import socket
 import time
 from html import unescape
@@ -11,12 +14,14 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
 import qrcode
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdf_canvas
@@ -25,15 +30,38 @@ from reportlab.pdfgen import canvas as pdf_canvas
 ROOT = Path(__file__).parent
 WEB_DIR = ROOT / "web"
 DATA_DIR = ROOT / "data"
+COURSES_DIR = DATA_DIR / "courses"
 STATE_FILE = DATA_DIR / "state.json"
 PORT = 8080
+CHAT_MAX_CONCURRENCY = 5
+CHAT_INACTIVITY_SECONDS = 30
+PDF_MAX_FILES_PER_COURSE = 20
+PDF_MAX_SIZE_BYTES = 30 * 1024 * 1024
+MODEL_PATH = Path(
+    (Path(os.environ.get("MAXBOARD_MODEL_PATH", "")).expanduser())
+    if os.environ.get("MAXBOARD_MODEL_PATH")
+    else "/Users/stt/GIT/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+)
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 app = FastAPI(title="MaxBoard")
 state_lock = asyncio.Lock()
 clients_lock = asyncio.Lock()
 clients: list[WebSocket] = []
+client_roles: dict[int, str] = {}
 state: dict[str, Any] = {}
+_llm = None
+_embedder = None
+course_rag_cache: dict[str, list[dict[str, Any]]] = {}
+pdf_reindex_state: dict[str, dict[str, Any]] = {}
+
+chat_lock = asyncio.Lock()
+chat_cond = asyncio.Condition(chat_lock)
+chat_queue: list[str] = []
+chat_active: set[str] = set()
+chat_sessions: dict[str, dict[str, Any]] = {}
+chat_prompts_session = 0
 
 
 class CreateCourseBody(BaseModel):
@@ -82,6 +110,26 @@ class ImportWhiteboardBody(BaseModel):
     name: Optional[str] = None
 
 
+class RenamePdfBody(BaseModel):
+    newName: str
+
+
+class ChatAskBody(BaseModel):
+    sessionId: str
+    studentName: str
+    courseId: str
+    whiteboardId: str
+    hotspotId: str
+    hotspotTitle: str = ""
+    hotspotHtml: str = ""
+    allHotspots: list[dict[str, Any]] = []
+    prompt: str
+
+
+class ChatReleaseBody(BaseModel):
+    sessionId: str
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -106,12 +154,316 @@ def detect_local_ip() -> str:
         return "127.0.0.1"
 
 
+def sanitize_filename(name: str, fallback: str = "document.pdf") -> str:
+    raw = re.sub(r"[^A-Za-z0-9_. -]", "_", (name or "").strip())
+    raw = raw.replace(" ", "_")
+    if not raw:
+        raw = fallback
+    if not raw.lower().endswith(".pdf"):
+        raw += ".pdf"
+    return raw[:180]
+
+
+def course_dir(course_id: str) -> Path:
+    return COURSES_DIR / str(course_id)
+
+
+def course_pdf_dir(course_id: str) -> Path:
+    return course_dir(course_id) / "pdfs"
+
+
+def course_index_file(course_id: str) -> Path:
+    return course_dir(course_id) / "pdf_index.json"
+
+
+def get_llm():
+    global _llm
+    if _llm is not None:
+        return _llm
+    if not MODEL_PATH.exists():
+        raise HTTPException(503, f"Modèle introuvable: {MODEL_PATH}")
+    try:
+        from llama_cpp import Llama
+    except Exception as exc:
+        raise HTTPException(503, f"llama-cpp-python indisponible: {exc}")
+    _llm = Llama(model_path=str(MODEL_PATH), n_ctx=8192, n_gpu_layers=-1, verbose=False)
+    return _llm
+
+
+def get_embedder():
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+    try:
+        from fastembed import TextEmbedding
+    except Exception as exc:
+        raise HTTPException(503, f"fastembed indisponible: {exc}")
+    _embedder = TextEmbedding(model_name=EMBED_MODEL)
+    return _embedder
+
+
+def split_text_chunks(text: str, chunk_size: int = 900, overlap: int = 140) -> list[str]:
+    src = re.sub(r"\s+", " ", text or "").strip()
+    if not src:
+        return []
+    chunks: list[str] = []
+    i = 0
+    n = len(src)
+    while i < n:
+        j = min(n, i + chunk_size)
+        piece = src[i:j].strip()
+        if piece:
+            chunks.append(piece)
+        if j >= n:
+            break
+        i = max(i + 1, j - overlap)
+    return chunks
+
+
+def load_course_index(course_id: str) -> list[dict[str, Any]]:
+    if course_id in course_rag_cache:
+        return course_rag_cache[course_id]
+    idx_file = course_index_file(course_id)
+    if not idx_file.exists():
+        course_rag_cache[course_id] = []
+        return []
+    try:
+        payload = json.loads(idx_file.read_text(encoding="utf-8"))
+        chunks = payload.get("chunks", [])
+        hydrated: list[dict[str, Any]] = []
+        for c in chunks:
+            emb = c.get("embedding")
+            if not isinstance(emb, list):
+                continue
+            item = {
+                "source": c.get("source", ""),
+                "page": int(c.get("page", 0)),
+                "text": c.get("text", ""),
+                "vec": np.array(emb, dtype=np.float32),
+            }
+            hydrated.append(item)
+        course_rag_cache[course_id] = hydrated
+        return hydrated
+    except Exception:
+        course_rag_cache[course_id] = []
+        return []
+
+
+def cosine_score(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1e-8:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def retrieve_course_rag(course_id: str, query: str, top_k: int = 4) -> list[dict[str, Any]]:
+    chunks = load_course_index(course_id)
+    if not chunks:
+        return []
+    embedder = get_embedder()
+    qvec = np.array(list(embedder.embed([query]))[0], dtype=np.float32)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for c in chunks:
+        vec = c.get("vec")
+        if vec is None:
+            continue
+        scored.append((cosine_score(qvec, vec), c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item for score, item in scored[:top_k] if score > 0.05]
+
+
+def rebuild_course_index_sync(course_id: str) -> dict[str, Any]:
+    cpdf = course_pdf_dir(course_id)
+    cpdf.mkdir(parents=True, exist_ok=True)
+    files = sorted([p for p in cpdf.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"], key=lambda p: p.name.lower())
+    collected: list[dict[str, Any]] = []
+    embedder = get_embedder()
+    for pdf in files:
+        try:
+            reader = PdfReader(str(pdf))
+        except Exception:
+            continue
+        chunks_raw: list[tuple[int, str]] = []
+        for page_idx, page in enumerate(reader.pages):
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            for chunk in split_text_chunks(txt):
+                chunks_raw.append((page_idx + 1, chunk))
+        if not chunks_raw:
+            continue
+        embeds = list(embedder.embed([c[1] for c in chunks_raw]))
+        for i, (page_num, txt) in enumerate(chunks_raw):
+            collected.append(
+                {
+                    "source": pdf.name,
+                    "page": page_num,
+                    "text": txt,
+                    "embedding": [float(x) for x in np.array(embeds[i], dtype=np.float32).tolist()],
+                }
+            )
+    idx_file = course_index_file(course_id)
+    idx_file.parent.mkdir(parents=True, exist_ok=True)
+    idx_file.write_text(
+        json.dumps(
+            {
+                "updatedAt": now_ms(),
+                "courseId": course_id,
+                "files": [p.name for p in files],
+                "chunks": collected,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    course_rag_cache.pop(course_id, None)
+    load_course_index(course_id)
+    return {"fileCount": len(files), "chunkCount": len(collected)}
+
+
+async def rebuild_course_index(course_id: str) -> None:
+    pdf_reindex_state[course_id] = {"running": True, "error": "", "updatedAt": now_ms()}
+    await broadcast({"type": "pdf_indexing", "courseId": course_id, "running": True, "error": ""})
+    try:
+        stats = await asyncio.to_thread(rebuild_course_index_sync, course_id)
+        pdf_reindex_state[course_id] = {"running": False, "error": "", "updatedAt": now_ms(), **stats}
+        await broadcast(
+            {
+                "type": "pdf_indexing",
+                "courseId": course_id,
+                "running": False,
+                "error": "",
+                "fileCount": stats.get("fileCount", 0),
+                "chunkCount": stats.get("chunkCount", 0),
+            }
+        )
+    except Exception as exc:
+        pdf_reindex_state[course_id] = {"running": False, "error": str(exc), "updatedAt": now_ms()}
+        await broadcast({"type": "pdf_indexing", "courseId": course_id, "running": False, "error": str(exc)})
+
+
+def chat_supervision_payload() -> dict[str, Any]:
+    queue_items = [
+        {
+            "sessionId": sid,
+            "name": chat_sessions.get(sid, {}).get("studentName", "Étudiant"),
+            "position": idx + 1,
+        }
+        for idx, sid in enumerate(chat_queue)
+    ]
+    active_items = [
+        {
+            "sessionId": sid,
+            "name": chat_sessions.get(sid, {}).get("studentName", "Étudiant"),
+        }
+        for sid in sorted(chat_active)
+    ]
+    return {
+        "queueLength": len(chat_queue),
+        "activeCount": len(chat_active),
+        "queue": queue_items,
+        "active": active_items,
+        "promptsSession": int(chat_prompts_session),
+        "promptsTotal": int(state.get("metrics", {}).get("promptsTotal", 0)),
+    }
+
+
+def chat_session_payload(session_id: str) -> dict[str, Any]:
+    position = chat_queue.index(session_id) + 1 if session_id in chat_queue else 0
+    return {
+        "sessionId": session_id,
+        "active": session_id in chat_active,
+        "position": position,
+        "queueLength": len(chat_queue),
+    }
+
+
+async def acquire_chat_slot(session_id: str) -> None:
+    async with chat_cond:
+        if session_id in chat_active:
+            return
+        if session_id not in chat_queue:
+            chat_queue.append(session_id)
+        while True:
+            can_take = len(chat_active) < CHAT_MAX_CONCURRENCY and chat_queue and chat_queue[0] == session_id
+            if can_take:
+                chat_queue.pop(0)
+                chat_active.add(session_id)
+                break
+            await chat_cond.wait()
+    await broadcast({"type": "chat_supervision", "data": chat_supervision_payload()})
+    await broadcast_users()
+
+
+async def release_chat_slot(session_id: str, clear_history: bool = True) -> None:
+    global chat_queue
+    async with chat_cond:
+        if session_id in chat_active:
+            chat_active.remove(session_id)
+        if session_id in chat_queue:
+            chat_queue = [sid for sid in chat_queue if sid != session_id]
+        session = chat_sessions.get(session_id)
+        if session:
+            if clear_history:
+                session["history"] = []
+            session["lastActivity"] = now_ms()
+        chat_cond.notify_all()
+    await broadcast({"type": "chat_supervision", "data": chat_supervision_payload()})
+    await broadcast_users()
+
+
+async def chat_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(5)
+        stale: list[str] = []
+        async with chat_lock:
+            now = now_ms()
+            for sid in list(chat_active):
+                sess = chat_sessions.get(sid, {})
+                last = int(sess.get("lastActivity", 0))
+                if now - last > CHAT_INACTIVITY_SECONDS * 1000:
+                    stale.append(sid)
+        for sid in stale:
+            await release_chat_slot(sid, clear_history=True)
+
+
+def build_chat_context(course_id: str, hotspot_title: str, hotspot_html: str, all_hotspots: list[dict[str, Any]], prompt: str) -> str:
+    current = stripped_html(hotspot_html or "")
+    all_h = []
+    for h in all_hotspots or []:
+        title = str(h.get("title", "Hotspot")).strip() or "Hotspot"
+        body = stripped_html(str(h.get("html", "")))
+        if not body:
+            continue
+        all_h.append(f"- {title}: {body[:500]}")
+    rag_chunks = retrieve_course_rag(course_id, prompt, top_k=4)
+    rag_text = []
+    for c in rag_chunks:
+        rag_text.append(f"- [{c.get('source','pdf')} p.{c.get('page', 0)}] {str(c.get('text', ''))[:550]}")
+    return (
+        f"Hotspot courant: {hotspot_title or 'Hotspot'}\n"
+        f"Contenu hotspot courant:\n{current[:2200]}\n\n"
+        f"Autres hotspots du whiteboard:\n{chr(10).join(all_h)[:3800]}\n\n"
+        f"Extraits RAG PDF du cours:\n{chr(10).join(rag_text)[:3800]}"
+    )
+
+
+def run_llm_chat(messages: list[dict[str, str]]) -> str:
+    llm = get_llm()
+    out = llm.create_chat_completion(messages=messages, max_tokens=500, temperature=0.2)
+    txt = out["choices"][0]["message"]["content"]
+    return str(txt or "").strip()
+
+
 def make_initial_state() -> dict[str, Any]:
     course_id = make_id("course")
     board_id = make_id("wb")
     return {
         "version": 1,
         "updatedAt": now_ms(),
+        "metrics": {"promptsTotal": 0},
         "activeCourseId": course_id,
         "activeWhiteboardId": board_id,
         "courses": [
@@ -144,6 +496,9 @@ def load_state_from_disk() -> dict[str, Any]:
             return make_initial_state()
         if "courses" not in payload or "whiteboards" not in payload:
             return make_initial_state()
+        if "metrics" not in payload or not isinstance(payload.get("metrics"), dict):
+            payload["metrics"] = {"promptsTotal": 0}
+        payload["metrics"]["promptsTotal"] = int(payload["metrics"].get("promptsTotal", 0))
         return payload
     except Exception:
         return make_initial_state()
@@ -297,7 +652,16 @@ async def broadcast(payload: dict[str, Any], exclude: Optional[WebSocket] = None
 async def broadcast_users() -> None:
     async with clients_lock:
         count = len(clients)
-    await broadcast({"type": "users", "count": count})
+        students = sum(1 for ws in clients if client_roles.get(id(ws), "student") == "student")
+    await broadcast(
+        {
+            "type": "users",
+            "count": count,
+            "students": students,
+            "queue": len(chat_queue),
+            "promptsSession": int(chat_prompts_session),
+        }
+    )
 
 
 async def broadcast_catalog_and_active() -> None:
@@ -314,8 +678,10 @@ async def broadcast_catalog_and_active() -> None:
 async def startup() -> None:
     global state
     state = load_state_from_disk()
+    COURSES_DIR.mkdir(parents=True, exist_ok=True)
     ensure_active_consistency()
     touch_and_save()
+    asyncio.create_task(chat_cleanup_loop())
 
 
 @app.get("/")
@@ -326,10 +692,13 @@ async def root() -> FileResponse:
 @app.get("/api/bootstrap")
 async def api_bootstrap() -> dict[str, Any]:
     host = detect_local_ip()
+    course_id = state.get("activeCourseId", "")
     return {
         "state": public_state(),
         "activeBoard": active_board_payload(),
         "shareBaseUrl": f"http://{host}:{PORT}",
+        "pdfIndexing": pdf_reindex_state.get(course_id, {"running": False, "error": "", "updatedAt": 0}),
+        "chatSupervision": chat_supervision_payload(),
     }
 
 
@@ -356,6 +725,7 @@ async def create_course(body: CreateCourseBody) -> dict[str, Any]:
         }
         state["activeCourseId"] = cid
         state["activeWhiteboardId"] = wid
+        course_pdf_dir(cid).mkdir(parents=True, exist_ok=True)
         touch_and_save()
     await broadcast_catalog_and_active()
     return {"ok": True}
@@ -420,6 +790,9 @@ async def delete_course(course_id: str) -> dict[str, Any]:
         state["courses"] = [c for c in state["courses"] if c["id"] != course_id]
         for wid in wb_ids:
             state["whiteboards"].pop(wid, None)
+        cdir = course_dir(course_id)
+        if cdir.exists():
+            shutil.rmtree(cdir, ignore_errors=True)
         touch_and_save()
     await broadcast_catalog_and_active()
     return {"ok": True}
@@ -603,6 +976,69 @@ async def activate_whiteboard(body: ActivateWhiteboardBody) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.get("/api/courses/{course_id}/pdfs")
+async def list_course_pdfs(course_id: str) -> dict[str, Any]:
+    async with state_lock:
+        course = get_course(course_id)
+        cpdf = course_pdf_dir(course["id"])
+        cpdf.mkdir(parents=True, exist_ok=True)
+        files = sorted([p for p in cpdf.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"], key=lambda p: p.name.lower())
+        rows = []
+        for p in files:
+            st = p.stat()
+            rows.append({"name": p.name, "size": int(st.st_size), "updatedAt": int(st.st_mtime * 1000)})
+        status = pdf_reindex_state.get(course["id"], {"running": False, "error": "", "updatedAt": 0})
+    return {"courseId": course_id, "files": rows, "indexing": status}
+
+
+@app.post("/api/courses/{course_id}/pdfs/upload")
+async def upload_course_pdf(course_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    async with state_lock:
+        course = get_course(course_id)
+        cpdf = course_pdf_dir(course["id"])
+        cpdf.mkdir(parents=True, exist_ok=True)
+        files = [p for p in cpdf.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+        if len(files) >= PDF_MAX_FILES_PER_COURSE:
+            raise HTTPException(400, f"Maximum {PDF_MAX_FILES_PER_COURSE} PDFs par cours")
+        name = sanitize_filename(file.filename or "document.pdf")
+        target = cpdf / name
+        blob = await file.read()
+        if len(blob) > PDF_MAX_SIZE_BYTES:
+            raise HTTPException(400, f"PDF trop volumineux (max {PDF_MAX_SIZE_BYTES // (1024 * 1024)} MB)")
+        target.write_bytes(blob)
+    asyncio.create_task(rebuild_course_index(course_id))
+    return {"ok": True, "name": name}
+
+
+@app.patch("/api/courses/{course_id}/pdfs/{pdf_name}")
+async def rename_course_pdf(course_id: str, pdf_name: str, body: RenamePdfBody) -> dict[str, Any]:
+    async with state_lock:
+        course = get_course(course_id)
+        cpdf = course_pdf_dir(course["id"])
+        src = cpdf / sanitize_filename(pdf_name)
+        if not src.exists():
+            raise HTTPException(404, "PDF introuvable")
+        dst = cpdf / sanitize_filename(body.newName)
+        if dst.exists():
+            raise HTTPException(400, "Un PDF avec ce nom existe déjà")
+        src.rename(dst)
+    asyncio.create_task(rebuild_course_index(course_id))
+    return {"ok": True}
+
+
+@app.delete("/api/courses/{course_id}/pdfs/{pdf_name}")
+async def delete_course_pdf(course_id: str, pdf_name: str) -> dict[str, Any]:
+    async with state_lock:
+        course = get_course(course_id)
+        cpdf = course_pdf_dir(course["id"])
+        target = cpdf / sanitize_filename(pdf_name)
+        if not target.exists():
+            raise HTTPException(404, "PDF introuvable")
+        target.unlink()
+    asyncio.create_task(rebuild_course_index(course_id))
+    return {"ok": True}
+
+
 @app.get("/api/qr")
 async def api_qr(url: str = Query(..., min_length=3, max_length=2000)) -> Response:
     img = qrcode.make(url)
@@ -698,11 +1134,122 @@ async def export_pdf(body: ExportPdfBody) -> Response:
     )
 
 
+@app.get("/api/chat/queue/{session_id}")
+async def chat_queue_status(session_id: str) -> dict[str, Any]:
+    async with chat_lock:
+        return {
+            **chat_session_payload(session_id),
+            "supervision": chat_supervision_payload(),
+        }
+
+
+@app.get("/api/chat/supervision")
+async def chat_supervision() -> dict[str, Any]:
+    async with chat_lock:
+        return chat_supervision_payload()
+
+
+@app.post("/api/chat/release")
+async def chat_release(body: ChatReleaseBody) -> dict[str, Any]:
+    await release_chat_slot(body.sessionId, clear_history=True)
+    return {"ok": True}
+
+
+@app.post("/api/chat/hotspot")
+async def chat_hotspot(body: ChatAskBody) -> dict[str, Any]:
+    global chat_prompts_session
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "Prompt vide")
+
+    session_id = str(body.sessionId or "").strip()
+    if not session_id:
+        raise HTTPException(400, "sessionId requis")
+    name = sanitize_name(body.studentName, "Étudiant")
+    async with chat_lock:
+        sess = chat_sessions.setdefault(
+            session_id,
+            {
+                "studentName": name,
+                "history": [],
+                "lastActivity": now_ms(),
+                "courseId": body.courseId,
+                "whiteboardId": body.whiteboardId,
+                "hotspotId": body.hotspotId,
+            },
+        )
+        sess["studentName"] = name
+        sess["courseId"] = body.courseId
+        sess["whiteboardId"] = body.whiteboardId
+        sess["hotspotId"] = body.hotspotId
+        sess["lastActivity"] = now_ms()
+
+    await acquire_chat_slot(session_id)
+
+    try:
+        context = build_chat_context(
+            course_id=body.courseId,
+            hotspot_title=body.hotspotTitle,
+            hotspot_html=body.hotspotHtml,
+            all_hotspots=body.allHotspots or [],
+            prompt=prompt,
+        )
+        async with chat_lock:
+            sess = chat_sessions[session_id]
+            history = list(sess.get("history", []))[-8:]
+            sess["history"] = history
+            chat_prompts_session += 1
+        async with state_lock:
+            state.setdefault("metrics", {})
+            state["metrics"]["promptsTotal"] = int(state["metrics"].get("promptsTotal", 0)) + 1
+            touch_and_save()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un assistant pédagogique concis. Réponds en français. "
+                    "Appuie-toi d'abord sur le hotspot courant, puis sur les autres hotspots, puis sur les extraits PDF RAG. "
+                    "Si une info manque, dis-le clairement."
+                ),
+            },
+            {"role": "system", "content": context[:9000]},
+        ]
+        for item in history:
+            role = item.get("role")
+            content = str(item.get("content", ""))
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content[:2000]})
+        messages.append({"role": "user", "content": prompt[:2000]})
+        answer = await asyncio.to_thread(run_llm_chat, messages)
+        async with chat_lock:
+            sess = chat_sessions.get(session_id, {})
+            h = list(sess.get("history", []))
+            h.append({"role": "user", "content": prompt})
+            h.append({"role": "assistant", "content": answer})
+            sess["history"] = h[-10:]
+            sess["lastActivity"] = now_ms()
+        await broadcast({"type": "chat_supervision", "data": chat_supervision_payload()})
+        await broadcast_users()
+        return {
+            "ok": True,
+            "answer": answer,
+            "session": chat_session_payload(session_id),
+            "supervision": chat_supervision_payload(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Erreur chat: {exc}")
+
+
 @app.websocket("/ws/live")
 async def ws_live(websocket: WebSocket, role: str = "student") -> None:
     await websocket.accept()
     async with clients_lock:
         clients.append(websocket)
+        client_roles[id(websocket)] = role
+        users_count = len(clients)
+        students_count = sum(1 for ws in clients if client_roles.get(id(ws), "student") == "student")
 
     await send_json(
         websocket,
@@ -711,7 +1258,10 @@ async def ws_live(websocket: WebSocket, role: str = "student") -> None:
             "role": role,
             "state": public_state(),
             "activeBoard": active_board_payload(),
-            "users": len(clients),
+            "users": users_count,
+            "students": students_count,
+            "pdfIndexing": pdf_reindex_state.get(state.get("activeCourseId", ""), {"running": False, "error": "", "updatedAt": 0}),
+            "chatSupervision": chat_supervision_payload(),
         },
     )
     await broadcast_users()
@@ -814,6 +1364,7 @@ async def ws_live(websocket: WebSocket, role: str = "student") -> None:
         async with clients_lock:
             if websocket in clients:
                 clients.remove(websocket)
+            client_roles.pop(id(websocket), None)
         await broadcast_users()
 
 

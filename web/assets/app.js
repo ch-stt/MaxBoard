@@ -32,6 +32,7 @@
     stage: document.getElementById("board-stage"),
     canvas: document.getElementById("board-canvas"),
     hotspotLayer: document.getElementById("hotspot-layer"),
+    supervisionChip: document.getElementById("supervision-chip"),
     imageActions: document.getElementById("image-actions"),
     imageDuplicateBtn: document.getElementById("image-duplicate-btn"),
     imageDeleteBtn: document.getElementById("image-delete-btn"),
@@ -41,6 +42,7 @@
     courseCreateBtn: document.getElementById("course-create-btn"),
     courseRenameBtn: document.getElementById("course-rename-btn"),
     courseDuplicateBtn: document.getElementById("course-duplicate-btn"),
+    coursePdfsBtn: document.getElementById("course-pdfs-btn"),
     courseDeleteBtn: document.getElementById("course-delete-btn"),
     wbCreateBtn: document.getElementById("wb-create-btn"),
     wbRenameBtn: document.getElementById("wb-rename-btn"),
@@ -58,12 +60,31 @@
     contentDialog: document.getElementById("content-dialog"),
     contentTitle: document.getElementById("content-title"),
     contentHtml: document.getElementById("content-html"),
+    chatWrap: document.getElementById("hotspot-chat-wrap"),
+    chatQueueStatus: document.getElementById("chat-queue-status"),
+    chatMessages: document.getElementById("chat-messages"),
+    chatInput: document.getElementById("chat-input"),
+    chatSendBtn: document.getElementById("chat-send-btn"),
+    chatReleaseBtn: document.getElementById("chat-release-btn"),
     shareDialog: document.getElementById("share-dialog"),
     shareTitle: document.getElementById("share-title"),
     shareUrl: document.getElementById("share-url"),
     shareQr: document.getElementById("share-qr"),
     shareCopyBtn: document.getElementById("share-copy-btn"),
     shareCloseBtn: document.getElementById("share-close-btn"),
+    pdfDialog: document.getElementById("pdf-dialog"),
+    pdfStatus: document.getElementById("pdf-status"),
+    pdfDogLoader: document.getElementById("pdf-dog-loader"),
+    pdfList: document.getElementById("pdf-list"),
+    pdfUploadInput: document.getElementById("pdf-upload-input"),
+    pdfUploadBtn: document.getElementById("pdf-upload-btn"),
+    pdfRefreshBtn: document.getElementById("pdf-refresh-btn"),
+    pdfCloseBtn: document.getElementById("pdf-close-btn"),
+    supervisionDialog: document.getElementById("supervision-dialog"),
+    supervisionSummary: document.getElementById("supervision-summary"),
+    supervisionQueue: document.getElementById("supervision-queue"),
+    supervisionActive: document.getElementById("supervision-active"),
+    barkAudio: document.getElementById("bark-audio"),
     status: document.getElementById("status"),
   };
 
@@ -73,6 +94,7 @@
     activeBoard: null,
     ws: null,
     users: 0,
+    students: 0,
     tool: "pen",
     color: "#1a1a1a",
     size: 3,
@@ -88,6 +110,28 @@
     selectedCourseId: null,
     selectedWbId: null,
     editingHotspot: null,
+    openHotspot: null,
+    chat: {
+      studentName: "",
+      sessionId: "",
+      messages: [],
+      pending: false,
+      queue: { active: false, position: 0, queueLength: 0 },
+      pollTimer: null,
+    },
+    supervision: {
+      queueLength: 0,
+      activeCount: 0,
+      queue: [],
+      active: [],
+      promptsSession: 0,
+      promptsTotal: 0,
+    },
+    pdfs: {
+      files: [],
+      indexing: { running: false, error: "" },
+      currentCourseId: "",
+    },
     pinch: null,
     imageCache: {},
   };
@@ -96,6 +140,124 @@
     const roleTxt = isTeacher ? "Prof" : "Consultation";
     const wb = state.activeBoard ? state.activeBoard.name : "-";
     els.status.textContent = `${roleTxt} | ${state.users} connectés | ${wb} | ${msg}`;
+  }
+
+  function ensureChatIdentity() {
+    let sid = sessionStorage.getItem("maxboard_chat_session_id") || "";
+    if (!sid) {
+      sid = `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      sessionStorage.setItem("maxboard_chat_session_id", sid);
+    }
+    state.chat.sessionId = sid;
+    let studentName = sessionStorage.getItem("maxboard_student_name") || "";
+    if (!studentName) {
+      const asked = prompt("Entrez votre nom pour le chat :", "");
+      if (!asked) return false;
+      studentName = asked.trim();
+      if (!studentName) return false;
+      sessionStorage.setItem("maxboard_student_name", studentName);
+    }
+    state.chat.studentName = studentName;
+    return true;
+  }
+
+  function renderChatMessages() {
+    const box = els.chatMessages;
+    box.innerHTML = "";
+    (state.chat.messages || []).forEach((m) => {
+      const el = document.createElement("div");
+      el.className = `chat-msg ${m.role === "user" ? "user" : "assistant"}`;
+      const body = document.createElement("div");
+      body.textContent = m.content || "";
+      el.appendChild(body);
+      if (m.role === "assistant" && Number.isFinite(Number(m.elapsedMs))) {
+        const t = document.createElement("div");
+        t.className = "chat-msg-time";
+        const ms = Number(m.elapsedMs);
+        t.textContent = ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(ms)} ms`;
+        el.appendChild(t);
+      }
+      box.appendChild(el);
+    });
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function animateAssistantText(text, mode = "word", elapsedMs = null) {
+    const full = String(text || "");
+    const msg = { role: "assistant", content: "", elapsedMs };
+    state.chat.messages.push(msg);
+    renderChatMessages();
+
+    const units =
+      mode === "char"
+        ? Array.from(full)
+        : full.split(/(\s+)/).filter((x) => x && x.length > 0);
+
+    const delayMs = mode === "char" ? 12 : 42;
+    const stride = mode === "char" ? 2 : 1;
+    for (let i = 0; i < units.length; i += stride) {
+      msg.content += units.slice(i, i + stride).join("");
+      renderChatMessages();
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+    }
+    if (msg.content !== full) {
+      msg.content = full;
+      renderChatMessages();
+    }
+  }
+
+  function renderSupervisionChip() {
+    if (!isTeacher) return;
+    const q = Number(state.supervision.queueLength || 0);
+    const students = Number(state.students || 0);
+    const promptsSession = Number(state.supervision.promptsSession || 0);
+    els.supervisionChip.textContent = `Étudiants ${students} | File ${q} | Prompts ${promptsSession}`;
+    els.supervisionChip.classList.remove("hidden");
+  }
+
+  function renderSupervisionDialog() {
+    const s = state.supervision || {};
+    els.supervisionSummary.textContent = `Actifs IA: ${s.activeCount || 0} / 5 | Prompts session: ${s.promptsSession || 0} | Prompts total: ${s.promptsTotal || 0}`;
+    const qList = (s.queue || []).map((x) => `${x.position}. ${x.name}`).join("\n") || "File vide.";
+    const aList = (s.active || []).map((x) => `• ${x.name}`).join("\n") || "Aucune session active.";
+    els.supervisionQueue.textContent = `File d'attente:\n${qList}`;
+    els.supervisionActive.textContent = `Sessions actives:\n${aList}`;
+  }
+
+  function updateChatQueueStatus() {
+    const q = state.chat.queue || { active: false, position: 0, queueLength: 0 };
+    if (q.active) {
+      els.chatQueueStatus.textContent = "Actif";
+      return;
+    }
+    if (q.position > 0) {
+      els.chatQueueStatus.textContent = `En file (#${q.position}/${q.queueLength})`;
+      return;
+    }
+    els.chatQueueStatus.textContent = "Libre";
+  }
+
+  function setPdfLoader(isRunning) {
+    els.pdfDogLoader.classList.toggle("hidden", !isRunning);
+    if (!isRunning) return;
+    try {
+      els.barkAudio.currentTime = 0;
+      els.barkAudio.pause();
+    } catch (_err) {}
+  }
+
+  function playBarkShort() {
+    try {
+      els.barkAudio.currentTime = 0;
+      const p = els.barkAudio.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+      window.setTimeout(() => {
+        try {
+          els.barkAudio.pause();
+          els.barkAudio.currentTime = 0;
+        } catch (_err) {}
+      }, 2200);
+    } catch (_err) {}
   }
 
   function refreshPresetColorUI() {
@@ -421,6 +583,7 @@
     els.courseBtn.textContent = c ? `Cours: ${c.name}` : "Cours";
     renderCourseDialog();
     render();
+    renderSupervisionChip();
     setStatus("Synchronisé");
   }
 
@@ -443,12 +606,43 @@
       }
       if (msg.type === "init") {
         state.users = Number(msg.users || 0);
+        state.students = Number(msg.students || 0);
+        if (msg.chatSupervision) state.supervision = msg.chatSupervision;
+        if (msg.pdfIndexing) state.pdfs.indexing = msg.pdfIndexing;
         syncCatalog(msg.state, msg.activeBoard);
+        renderSupervisionChip();
         return;
       }
       if (msg.type === "users") {
         state.users = Number(msg.count || 0);
+        state.students = Number(msg.students || 0);
+        state.supervision.queueLength = Number(msg.queue || 0);
+        state.supervision.promptsSession = Number(msg.promptsSession || state.supervision.promptsSession || 0);
+        renderSupervisionChip();
         setStatus("Connecté");
+        return;
+      }
+      if (msg.type === "pdf_indexing") {
+        if (!state.catalog || msg.courseId !== state.catalog.activeCourseId) return;
+        const wasRunning = Boolean(state.pdfs.indexing && state.pdfs.indexing.running);
+        state.pdfs.indexing = {
+          running: Boolean(msg.running),
+          error: String(msg.error || ""),
+          updatedAt: Date.now(),
+        };
+        renderPdfDialog();
+        if (wasRunning && !msg.running && !msg.error) {
+          playBarkShort();
+          if (state.pdfs.currentCourseId) {
+            loadCoursePdfs(state.pdfs.currentCourseId).catch(() => {});
+          }
+        }
+        return;
+      }
+      if (msg.type === "chat_supervision" && msg.data) {
+        state.supervision = msg.data;
+        renderSupervisionChip();
+        if (els.supervisionDialog.open) renderSupervisionDialog();
         return;
       }
       if (msg.type === "catalog") {
@@ -539,10 +733,13 @@
   }
 
   function openHotspotContent(h) {
+    state.openHotspot = { ...h };
     els.contentTitle.textContent = h.title || "Hotspot";
     els.contentTitle.classList.add("hotspot-content-title");
     els.contentTitle.style.background = h.color || "#2f6feb";
     els.contentHtml.innerHTML = h.html || "<p>(vide)</p>";
+    renderChatMessages();
+    updateChatQueueStatus();
     els.contentDialog.showModal();
   }
 
@@ -661,6 +858,110 @@
     downloadBlob(blob, `${state.activeBoard.name || "whiteboard"}.pdf`);
   }
 
+  async function loadCoursePdfs(courseId) {
+    if (!courseId) return;
+    const data = await api(`/api/courses/${courseId}/pdfs`);
+    state.pdfs.currentCourseId = courseId;
+    state.pdfs.files = data.files || [];
+    state.pdfs.indexing = data.indexing || { running: false, error: "" };
+    renderPdfDialog();
+  }
+
+  function renderPdfDialog() {
+    const idx = state.pdfs.indexing || { running: false, error: "" };
+    if (idx.running) {
+      els.pdfStatus.textContent = "Indexation en cours...";
+    } else if (idx.error) {
+      els.pdfStatus.textContent = `Erreur indexation: ${idx.error}`;
+    } else {
+      els.pdfStatus.textContent = "Indexation prête.";
+    }
+    setPdfLoader(Boolean(idx.running));
+    els.pdfList.innerHTML = "";
+    (state.pdfs.files || []).forEach((f) => {
+      const row = document.createElement("div");
+      row.className = "pdf-row";
+      const name = document.createElement("div");
+      name.className = "pdf-name";
+      name.textContent = `${f.name} (${Math.round((Number(f.size || 0) / 1024) * 10) / 10} KB)`;
+      const renameBtn = document.createElement("button");
+      renameBtn.className = "btn";
+      renameBtn.textContent = "Renommer";
+      renameBtn.onclick = async () => {
+        const next = prompt("Nouveau nom PDF :", f.name);
+        if (!next || next === f.name) return;
+        await api(`/api/courses/${state.pdfs.currentCourseId}/pdfs/${encodeURIComponent(f.name)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ newName: next }),
+        });
+        await loadCoursePdfs(state.pdfs.currentCourseId);
+      };
+      const delBtn = document.createElement("button");
+      delBtn.className = "btn danger";
+      delBtn.textContent = "Effacer";
+      delBtn.onclick = async () => {
+        if (!confirm(`Supprimer ${f.name} ?`)) return;
+        await api(`/api/courses/${state.pdfs.currentCourseId}/pdfs/${encodeURIComponent(f.name)}`, { method: "DELETE" });
+        await loadCoursePdfs(state.pdfs.currentCourseId);
+      };
+      row.append(name, renameBtn, delBtn);
+      els.pdfList.appendChild(row);
+    });
+  }
+
+  async function submitHotspotChatPrompt() {
+    if (!state.openHotspot || !state.catalog || !state.activeBoard) return;
+    const promptValue = (els.chatInput.value || "").trim();
+    if (!promptValue || state.chat.pending) return;
+    if (!ensureChatIdentity()) return;
+    state.chat.pending = true;
+    state.chat.messages.push({ role: "user", content: promptValue });
+    els.chatInput.value = "";
+    renderChatMessages();
+    updateChatQueueStatus();
+    const payload = {
+      sessionId: state.chat.sessionId,
+      studentName: state.chat.studentName,
+      courseId: state.catalog.activeCourseId,
+      whiteboardId: state.activeBoard.id,
+      hotspotId: state.openHotspot.id || "",
+      hotspotTitle: state.openHotspot.title || "",
+      hotspotHtml: state.openHotspot.html || "",
+      allHotspots: state.activeBoard.hotspots || [],
+      prompt: promptValue,
+    };
+    const poll = async () => {
+      try {
+        const q = await api(`/api/chat/queue/${encodeURIComponent(state.chat.sessionId)}`);
+        state.chat.queue = { active: !!q.active, position: Number(q.position || 0), queueLength: Number(q.queueLength || 0) };
+        if (q.supervision) state.supervision = q.supervision;
+        updateChatQueueStatus();
+        renderSupervisionChip();
+      } catch (_err) {}
+    };
+    poll();
+    state.chat.pollTimer = window.setInterval(poll, 900);
+    try {
+      const startedAt = performance.now();
+      const r = await api("/api/chat/hotspot", { method: "POST", body: JSON.stringify(payload) });
+      const elapsedMs = performance.now() - startedAt;
+      await animateAssistantText(r.answer || "(réponse vide)", "word", elapsedMs);
+      state.chat.queue = r.session || { active: false, position: 0, queueLength: 0 };
+      if (r.supervision) state.supervision = r.supervision;
+      renderSupervisionChip();
+      updateChatQueueStatus();
+    } catch (e) {
+      state.chat.messages.push({ role: "assistant", content: `Erreur: ${e.message || e}` });
+      renderChatMessages();
+    } finally {
+      state.chat.pending = false;
+      if (state.chat.pollTimer) {
+        window.clearInterval(state.chat.pollTimer);
+        state.chat.pollTimer = null;
+      }
+    }
+  }
+
   async function exportWhiteboardFile() {
     if (!state.activeBoard) return;
     const blob = await api(`/api/whiteboards/${state.activeBoard.id}/export`);
@@ -764,6 +1065,8 @@
     els.shareTeacherBtn.classList.add("hidden");
     els.exportWbBtn.classList.add("hidden");
     els.importWbBtn.classList.add("hidden");
+    els.coursePdfsBtn.classList.add("hidden");
+    els.supervisionChip.classList.add("hidden");
   }
 
   function setupEvents() {
@@ -865,6 +1168,30 @@
       els.importWbInput.click();
       els.burgerMenu.classList.add("hidden");
     };
+    els.pdfRefreshBtn.onclick = async () => {
+      const c = activeCourse();
+      if (!c) return;
+      await loadCoursePdfs(c.id);
+    };
+    const openPdfDialog = async () => {
+      const c = activeCourse();
+      if (!c) return;
+      await loadCoursePdfs(c.id);
+      els.pdfDialog.showModal();
+      els.burgerMenu.classList.add("hidden");
+    };
+    if (isTeacher) {
+      const pdfEntry = document.createElement("button");
+      pdfEntry.className = "menu-item";
+      pdfEntry.textContent = "PDFs du cours";
+      pdfEntry.onclick = () => {
+        openPdfDialog().catch((e) => alert(e.message));
+      };
+      if (!els.burgerMenu.querySelector("[data-role='pdf-entry']")) {
+        pdfEntry.dataset.role = "pdf-entry";
+        els.burgerMenu.insertBefore(pdfEntry, els.resetViewBtn);
+      }
+    }
     els.importWbInput.onchange = async () => {
       const file = els.importWbInput.files && els.importWbInput.files[0];
       if (!file) return;
@@ -916,6 +1243,12 @@
     els.courseDuplicateBtn.onclick = async () => {
       const id = state.catalog.activeCourseId;
       await api(`/api/courses/${id}/duplicate`, { method: "POST" });
+    };
+    els.coursePdfsBtn.onclick = async () => {
+      const c = activeCourse();
+      if (!c) return;
+      await loadCoursePdfs(c.id);
+      els.pdfDialog.showModal();
     };
     els.courseDeleteBtn.onclick = async () => {
       const id = state.catalog.activeCourseId;
@@ -993,6 +1326,64 @@
       send({ type: "hotspot_delete", id: state.editingHotspot.id });
       els.hotspotDialog.close();
     };
+    els.chatSendBtn.onclick = () => {
+      submitHotspotChatPrompt().catch((e) => {
+        alert(e.message || e);
+      });
+    };
+    els.chatInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        submitHotspotChatPrompt().catch((e) => {
+          alert(e.message || e);
+        });
+      }
+    });
+    els.chatReleaseBtn.onclick = async () => {
+      if (!state.chat.sessionId) return;
+      await api("/api/chat/release", {
+        method: "POST",
+        body: JSON.stringify({ sessionId: state.chat.sessionId }),
+      });
+      state.chat.messages = [];
+      state.chat.queue = { active: false, position: 0, queueLength: 0 };
+      renderChatMessages();
+      updateChatQueueStatus();
+    };
+    els.supervisionChip.onclick = () => {
+      if (!isTeacher) return;
+      renderSupervisionDialog();
+      els.supervisionDialog.showModal();
+    };
+    els.importWbInput.addEventListener("click", (ev) => ev.stopPropagation());
+    els.pdfUploadBtn.onclick = () => {
+      const c = activeCourse();
+      if (!c) return;
+      els.pdfUploadInput.value = "";
+      els.pdfUploadInput.click();
+    };
+    els.pdfUploadInput.onchange = async () => {
+      const c = activeCourse();
+      const f = els.pdfUploadInput.files && els.pdfUploadInput.files[0];
+      if (!c || !f) return;
+      const form = new FormData();
+      form.append("file", f);
+      const r = await fetch(`/api/courses/${c.id}/pdfs/upload`, { method: "POST", body: form });
+      if (!r.ok) {
+        const txt = await r.text();
+        alert(txt || `Upload impossible (${r.status})`);
+        return;
+      }
+      await loadCoursePdfs(c.id);
+    };
+    els.pdfCloseBtn.onclick = () => els.pdfDialog.close();
+    els.contentDialog.addEventListener("close", () => {
+      state.openHotspot = null;
+      if (state.chat.pollTimer) {
+        window.clearInterval(state.chat.pollTimer);
+        state.chat.pollTimer = null;
+      }
+    });
 
     let pointerId = null;
     els.stage.addEventListener("pointerdown", (ev) => {
@@ -1191,10 +1582,15 @@
     setupEvents();
     const data = await api("/api/bootstrap");
     state.shareBaseUrl = data.shareBaseUrl || location.origin;
+    if (data.chatSupervision) state.supervision = data.chatSupervision;
+    if (data.pdfIndexing) state.pdfs.indexing = data.pdfIndexing;
     syncCatalog(data.state, data.activeBoard);
     state.color = String(els.colorInput.value || "#1a1a1a").toLowerCase();
     state.size = Number(els.sizeInput.value || 3);
     refreshPresetColorUI();
+    renderSupervisionDialog();
+    renderSupervisionChip();
+    updateChatQueueStatus();
     resizeCanvas();
     connectWs();
     setStatus("Prêt");

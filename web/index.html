@@ -65,11 +65,16 @@
     <main id="stage-wrap">
       <div id="board-stage">
         <div id="wb-title" class="board-title"></div>
+        <button id="supervision-chip" class="supervision-chip hidden" type="button"></button>
         <canvas id="board-canvas" width="1600" height="900"></canvas>
         <div id="hotspot-layer"></div>
         <div id="image-actions" class="image-actions hidden">
           <button id="image-duplicate-btn" class="img-action-btn" title="Dupliquer">⧉</button>
           <button id="image-delete-btn" class="img-action-btn danger" title="Supprimer">🗑</button>
+        </div>
+        <div class="max-mascot">
+          <img src="/assets/max-bulldog.png" alt="Max le bouledogue" />
+          <span>MAX board</span>
         </div>
       </div>
     </main>
@@ -84,6 +89,7 @@
             <button id="course-create-btn" class="btn">Creer</button>
             <button id="course-rename-btn" class="btn">Renommer</button>
             <button id="course-duplicate-btn" class="btn">Dupliquer</button>
+            <button id="course-pdfs-btn" class="btn">PDFs</button>
             <button id="course-delete-btn" class="btn danger">Supprimer</button>
           </div>
         </section>
@@ -121,6 +127,20 @@
     <dialog id="content-dialog" class="dialog">
       <h3 id="content-title">Hotspot</h3>
       <article id="content-html" class="content-html"></article>
+      <section id="hotspot-chat-wrap" class="chat-wrap">
+        <div class="chat-head">
+          <strong>Chat</strong>
+          <span id="chat-queue-status" class="chat-status">Libre</span>
+        </div>
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="chat-input-row">
+          <textarea id="chat-input" rows="2" placeholder="Pose ta question..."></textarea>
+          <button id="chat-send-btn" class="btn primary">Envoyer</button>
+        </div>
+        <div class="chat-actions">
+          <button id="chat-release-btn" class="btn">Libérer le chat</button>
+        </div>
+      </section>
       <form method="dialog" class="dialog-foot">
         <button class="btn">Fermer</button>
       </form>
@@ -138,7 +158,34 @@
       </div>
     </dialog>
 
+    <dialog id="pdf-dialog" class="dialog">
+      <h3>PDFs du cours</h3>
+      <div id="pdf-status" class="pdf-status"></div>
+      <div id="pdf-dog-loader" class="pdf-dog-loader hidden">
+        <img src="/assets/max-bulldog.png" alt="Indexation en cours" />
+        <span>Max indexe les PDFs...</span>
+      </div>
+      <div id="pdf-list" class="list pdf-list"></div>
+      <input id="pdf-upload-input" type="file" accept=".pdf" class="hidden" />
+      <div class="actions">
+        <button id="pdf-upload-btn" class="btn">Ajouter PDF</button>
+        <button id="pdf-refresh-btn" class="btn">Rafraîchir</button>
+        <button id="pdf-close-btn" class="btn">Fermer</button>
+      </div>
+    </dialog>
+
+    <dialog id="supervision-dialog" class="dialog">
+      <h3>Supervision classe</h3>
+      <div id="supervision-summary" class="supervision-summary"></div>
+      <div id="supervision-queue" class="supervision-queue"></div>
+      <div id="supervision-active" class="supervision-active"></div>
+      <form method="dialog" class="dialog-foot">
+        <button class="btn">Fermer</button>
+      </form>
+    </dialog>
+
     <div id="status" class="status"></div>
+    <audio id="bark-audio" preload="auto" src="/assets/max-bark.mp3"></audio>
     <script src="/assets/app.js"></script>
   </body>
   </html>
