@@ -25,6 +25,9 @@
     shareTeacherBtn: document.getElementById("share-teacher-btn"),
     exportPngBtn: document.getElementById("export-png-btn"),
     exportPdfBtn: document.getElementById("export-pdf-btn"),
+    exportWbBtn: document.getElementById("export-wb-btn"),
+    importWbBtn: document.getElementById("import-wb-btn"),
+    importWbInput: document.getElementById("import-wb-input"),
     resetViewBtn: document.getElementById("reset-view-btn"),
     stage: document.getElementById("board-stage"),
     canvas: document.getElementById("board-canvas"),
@@ -42,6 +45,7 @@
     wbCreateBtn: document.getElementById("wb-create-btn"),
     wbRenameBtn: document.getElementById("wb-rename-btn"),
     wbDuplicateBtn: document.getElementById("wb-duplicate-btn"),
+    wbCopyToCourseBtn: document.getElementById("wb-copy-to-course-btn"),
     wbDeleteBtn: document.getElementById("wb-delete-btn"),
     hotspotDialog: document.getElementById("hotspot-dialog"),
     hotspotTitle: document.getElementById("hotspot-title"),
@@ -128,6 +132,11 @@
     return (state.catalog && state.catalog.whiteboards && state.catalog.whiteboards[id]) || null;
   }
 
+  function courseById(id) {
+    if (!state.catalog) return null;
+    return state.catalog.courses.find((c) => c.id === id) || null;
+  }
+
   function wbOrder() {
     const c = activeCourse();
     return c ? c.whiteboardOrder || [] : [];
@@ -135,6 +144,30 @@
 
   function makeId(prefix) {
     return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  }
+
+  function chooseTargetCourseId(defaultCourseId) {
+    const courses = (state.catalog && state.catalog.courses) || [];
+    const candidates = courses.filter((c) => c.id !== defaultCourseId);
+    if (!candidates.length) {
+      alert("Aucun autre cours disponible.");
+      return null;
+    }
+    const msg = [
+      "Copier vers quel cours ?",
+      "",
+      ...candidates.map((c, i) => `${i + 1}. ${c.name}`),
+      "",
+      "Entrez le numéro du cours cible :",
+    ].join("\n");
+    const raw = prompt(msg, "1");
+    if (!raw) return null;
+    const idx = Number(raw) - 1;
+    if (!Number.isFinite(idx) || idx < 0 || idx >= candidates.length) {
+      alert("Choix invalide.");
+      return null;
+    }
+    return candidates[idx].id;
   }
 
   function chooseTool(tool) {
@@ -628,6 +661,35 @@
     downloadBlob(blob, `${state.activeBoard.name || "whiteboard"}.pdf`);
   }
 
+  async function exportWhiteboardFile() {
+    if (!state.activeBoard) return;
+    const blob = await api(`/api/whiteboards/${state.activeBoard.id}/export`);
+    const safe = String(state.activeBoard.name || "whiteboard").replace(/[^A-Za-z0-9_.-]/g, "_");
+    downloadBlob(blob, `${safe}.maxboard.json`);
+  }
+
+  async function importWhiteboardFromFile(file) {
+    if (!file || !state.catalog) return;
+    const text = await file.text();
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch (_err) {
+      throw new Error("Fichier d'import invalide (JSON attendu).");
+    }
+    if (!payload || payload.format !== "maxboard.whiteboard.v1") {
+      throw new Error("Format d'import non supporté.");
+    }
+    const activeCourseId = state.catalog.activeCourseId;
+    await api("/api/whiteboards/import", {
+      method: "POST",
+      body: JSON.stringify({
+        payload,
+        targetCourseId: activeCourseId,
+      }),
+    });
+  }
+
   function renderList(container, items, activeId, onClick, onDropReorder) {
     container.innerHTML = "";
     let dragId = null;
@@ -700,6 +762,8 @@
     els.nextWbBtn.classList.add("hidden");
     els.teacherTools.classList.add("hidden");
     els.shareTeacherBtn.classList.add("hidden");
+    els.exportWbBtn.classList.add("hidden");
+    els.importWbBtn.classList.add("hidden");
   }
 
   function setupEvents() {
@@ -792,6 +856,25 @@
     els.shareTeacherBtn.onclick = () => openShare("teacher");
     els.exportPngBtn.onclick = () => exportPng();
     els.exportPdfBtn.onclick = () => exportPdf().catch((e) => alert(e.message));
+    els.exportWbBtn.onclick = () => {
+      exportWhiteboardFile().catch((e) => alert(e.message));
+      els.burgerMenu.classList.add("hidden");
+    };
+    els.importWbBtn.onclick = () => {
+      els.importWbInput.value = "";
+      els.importWbInput.click();
+      els.burgerMenu.classList.add("hidden");
+    };
+    els.importWbInput.onchange = async () => {
+      const file = els.importWbInput.files && els.importWbInput.files[0];
+      if (!file) return;
+      try {
+        await importWhiteboardFromFile(file);
+        setStatus("Whiteboard importé");
+      } catch (e) {
+        alert(e && e.message ? e.message : "Import impossible.");
+      }
+    };
     els.shareCopyBtn.onclick = async () => {
       await navigator.clipboard.writeText(els.shareUrl.value);
       setStatus("URL copiée");
@@ -858,6 +941,20 @@
       const wb = state.activeBoard;
       if (!wb) return;
       await api(`/api/whiteboards/${wb.id}/duplicate`, { method: "POST", body: JSON.stringify({}) });
+    };
+    els.wbCopyToCourseBtn.onclick = async () => {
+      const wb = state.activeBoard;
+      if (!wb) return;
+      const targetCourseId = chooseTargetCourseId(wb.courseId);
+      if (!targetCourseId) return;
+      const target = courseById(targetCourseId);
+      const ok = confirm(`Copier "${wb.name}" vers "${target ? target.name : "ce cours"}" ?`);
+      if (!ok) return;
+      await api(`/api/whiteboards/${wb.id}/duplicate`, {
+        method: "POST",
+        body: JSON.stringify({ targetCourseId }),
+      });
+      setStatus("Whiteboard copié");
     };
     els.wbDeleteBtn.onclick = async () => {
       const wb = state.activeBoard;

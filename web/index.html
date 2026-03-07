@@ -56,8 +56,11 @@
       <button id="share-teacher-btn" class="menu-item">QR Prof distant</button>
       <button id="export-png-btn" class="menu-item">Export PNG</button>
       <button id="export-pdf-btn" class="menu-item">Export PDF</button>
+      <button id="export-wb-btn" class="menu-item">Exporter ce whiteboard (.maxboard)</button>
+      <button id="import-wb-btn" class="menu-item">Importer un whiteboard (.maxboard)</button>
       <button id="reset-view-btn" class="menu-item">Reset zoom</button>
     </aside>
+    <input id="import-wb-input" type="file" accept=".json,.maxboard,.maxboard.json" class="hidden" />
 
     <main id="stage-wrap">
       <div id="board-stage">
@@ -91,6 +94,7 @@
             <button id="wb-create-btn" class="btn">Creer</button>
             <button id="wb-rename-btn" class="btn">Renommer</button>
             <button id="wb-duplicate-btn" class="btn">Dupliquer</button>
+            <button id="wb-copy-to-course-btn" class="btn">Copier vers cours</button>
             <button id="wb-delete-btn" class="btn danger">Supprimer</button>
           </div>
         </section>

@@ -76,6 +76,12 @@ class ExportPdfBody(BaseModel):
     hotspots: list[ExportPdfHotspot] = []
 
 
+class ImportWhiteboardBody(BaseModel):
+    payload: dict[str, Any]
+    targetCourseId: Optional[str] = None
+    name: Optional[str] = None
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -218,6 +224,27 @@ def board_summary(board: dict[str, Any]) -> dict[str, Any]:
         "strokeCount": len(board.get("strokes", [])),
         "imageCount": len(board.get("images", [])),
         "hotspotCount": len(board.get("hotspots", [])),
+    }
+
+
+def whiteboard_export_payload(whiteboard_id: str) -> dict[str, Any]:
+    wb = get_whiteboard(whiteboard_id)
+    course = get_course(wb["courseId"])
+    return {
+        "format": "maxboard.whiteboard.v1",
+        "exportedAt": now_ms(),
+        "source": {
+            "courseId": course["id"],
+            "courseName": course["name"],
+            "whiteboardId": wb["id"],
+            "whiteboardName": wb["name"],
+        },
+        "whiteboard": {
+            "name": wb["name"],
+            "strokes": copy.deepcopy(wb.get("strokes", [])),
+            "images": copy.deepcopy(wb.get("images", [])),
+            "hotspots": copy.deepcopy(wb.get("hotspots", [])),
+        },
     }
 
 
@@ -478,6 +505,57 @@ async def duplicate_whiteboard(whiteboard_id: str, body: DuplicateWhiteboardBody
         touch_and_save()
     await broadcast_catalog_and_active()
     return {"ok": True}
+
+
+@app.get("/api/whiteboards/{whiteboard_id}/export")
+async def export_whiteboard(whiteboard_id: str) -> Response:
+    async with state_lock:
+        payload = whiteboard_export_payload(whiteboard_id)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", payload["source"]["whiteboardName"] or "whiteboard")
+    content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.maxboard.json"'},
+    )
+
+
+@app.post("/api/whiteboards/import")
+async def import_whiteboard(body: ImportWhiteboardBody) -> dict[str, Any]:
+    async with state_lock:
+        payload = body.payload if isinstance(body.payload, dict) else {}
+        if payload.get("format") != "maxboard.whiteboard.v1":
+            raise HTTPException(400, "Format d'import non supporté")
+        whiteboard = payload.get("whiteboard")
+        if not isinstance(whiteboard, dict):
+            raise HTTPException(400, "Payload whiteboard invalide")
+
+        target_course_id = body.targetCourseId or state.get("activeCourseId")
+        course = get_course(str(target_course_id))
+
+        imported_name = sanitize_name(str(body.name or whiteboard.get("name") or "Whiteboard importé"), "Whiteboard importé")
+        strokes = whiteboard.get("strokes", [])
+        images = whiteboard.get("images", [])
+        hotspots = whiteboard.get("hotspots", [])
+        if not isinstance(strokes, list) or not isinstance(images, list) or not isinstance(hotspots, list):
+            raise HTTPException(400, "Payload strokes/images/hotspots invalide")
+
+        wid = make_id("wb")
+        state["whiteboards"][wid] = {
+            "id": wid,
+            "courseId": course["id"],
+            "name": imported_name,
+            "strokes": copy.deepcopy(strokes),
+            "images": copy.deepcopy(images),
+            "hotspots": copy.deepcopy(hotspots),
+        }
+        course.setdefault("whiteboardOrder", []).append(wid)
+        course["lastWhiteboardId"] = wid
+        state["activeCourseId"] = course["id"]
+        state["activeWhiteboardId"] = wid
+        touch_and_save()
+    await broadcast_catalog_and_active()
+    return {"ok": True, "whiteboardId": wid}
 
 
 @app.delete("/api/whiteboards/{whiteboard_id}")

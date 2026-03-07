@@ -6,6 +6,7 @@ Application locale de whiteboard enseignant, synchronisee en direct sur le meme 
 
 - Gestion de cours (creer, renommer, dupliquer, supprimer, reordonner)
 - Plusieurs whiteboards par cours (creer, renommer, dupliquer, supprimer, reordonner)
+- Copie d'un whiteboard vers un autre cours (avec hotspots)
 - Whiteboard temps reel (stylo, aquarelle, gomme, clear, undo, zoom, pan)
 - Coller des images depuis le presse-papiers
 - Hotspots (ajout, edition, suppression) avec contenu HTML leger
@@ -13,6 +14,7 @@ Application locale de whiteboard enseignant, synchronisee en direct sur le meme 
 - QR et URL separes: etudiants et prof distant
 - Export PNG
 - Export PDF: image du whiteboard + hotspots tries alphabetiquement (titre + contenu)
+- Export/import de whiteboard (.maxboard.json) pour echange entre profs
 - Sauvegarde automatique en temps reel dans `data/state.json`
 
 ## Installation
