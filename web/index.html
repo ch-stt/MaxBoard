@@ -202,8 +202,45 @@
       </div>
     </dialog>
 
+    <dialog id="password-dialog" class="dialog">
+      <h3>Changer mon mot de passe</h3>
+      <label>Mot de passe actuel
+        <input id="pwd-current-input" type="password" autocomplete="current-password" />
+      </label>
+      <label>Nouveau mot de passe
+        <input id="pwd-new-input" type="password" autocomplete="new-password" />
+      </label>
+      <label>Confirmer nouveau mot de passe
+        <input id="pwd-confirm-input" type="password" autocomplete="new-password" />
+      </label>
+      <div class="actions">
+        <button id="pwd-save-btn" class="btn primary" type="button">Sauver</button>
+        <button id="pwd-close-btn" class="btn" type="button">Fermer</button>
+      </div>
+    </dialog>
+
+    <dialog id="users-dialog" class="dialog">
+      <h3>Gestion des profs</h3>
+      <div id="users-list" class="list"></div>
+      <div class="actions">
+        <button id="users-refresh-btn" class="btn" type="button">Rafraîchir</button>
+      </div>
+      <hr />
+      <label>Nom d'utilisateur
+        <input id="new-user-name-input" type="text" autocomplete="off" />
+      </label>
+      <label>Mot de passe
+        <input id="new-user-password-input" type="password" autocomplete="new-password" />
+      </label>
+      <label><input id="new-user-admin-input" type="checkbox" /> Admin</label>
+      <div class="actions">
+        <button id="users-create-btn" class="btn primary" type="button">Créer prof</button>
+        <button id="users-close-btn" class="btn" type="button">Fermer</button>
+      </div>
+    </dialog>
+
     <div id="status" class="status"></div>
     <audio id="bark-audio" preload="auto" src="/assets/max-bark.mp3"></audio>
-    <script src="/assets/app.js?v=20260308-llm-topright-final"></script>
+    <script src="/assets/app.js?v=20260308-auth-users-ui-v2"></script>
   </body>
   </html>

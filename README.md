@@ -19,6 +19,7 @@ Application locale de whiteboard enseignant, synchronisee en direct sur le meme 
 - Export PDF: image du whiteboard + hotspots tries alphabetiquement (titre + contenu)
 - Export/import de whiteboard (.maxboard.json) pour echange entre profs
 - Sauvegarde automatique en temps reel dans `data/state.json`
+- Authentification prof (session cookie) + comptes stockes dans `data/users.json`
 
 ## Installation
 
@@ -39,6 +40,14 @@ Puis ouvrir:
 - `http://localhost:8080` (poste principal prof)
 - QR etudiant: `/?mode=student`
 - QR prof distant: `/?mode=teacher&remote=1`
+
+## Comptes profs
+
+- Login requis en mode prof.
+- Premier demarrage: compte admin auto-cree (`admin` / `maxboard`) si aucun utilisateur.
+- Override recommande via `.env`:
+  - `MAXBOARD_ADMIN_USER`
+  - `MAXBOARD_ADMIN_PASSWORD`
 
 ## IA locale
 

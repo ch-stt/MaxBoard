@@ -4,10 +4,14 @@ import copy
 import json
 import math
 import os
+import secrets
 import re
 import shutil
 import socket
 import time
+import hashlib
+import hmac
+import contextvars
 from html import unescape
 from io import BytesIO
 from pathlib import Path
@@ -34,11 +38,15 @@ DATA_DIR = ROOT / "data"
 COURSES_DIR = DATA_DIR / "courses"
 STATE_FILE = DATA_DIR / "state.json"
 ENV_FILE = ROOT / ".env"
+USERS_FILE = DATA_DIR / "users.json"
+TENANTS_DIR = DATA_DIR / "tenants"
 PORT = 8080
 CHAT_MAX_CONCURRENCY = 5
 CHAT_INACTIVITY_SECONDS = 30
 PDF_MAX_FILES_PER_COURSE = 20
 PDF_MAX_SIZE_BYTES = 30 * 1024 * 1024
+AUTH_SESSION_COOKIE = "maxboard_session"
+AUTH_SESSION_TTL_SECONDS = 60 * 60 * 12
 MODEL_PATH = Path(
     (Path(os.environ.get("MAXBOARD_MODEL_PATH", "")).expanduser())
     if os.environ.get("MAXBOARD_MODEL_PATH")
@@ -58,7 +66,8 @@ state_lock = asyncio.Lock()
 clients_lock = asyncio.Lock()
 clients: list[WebSocket] = []
 client_roles: dict[int, str] = {}
-state: dict[str, Any] = {}
+client_tenants: dict[int, str] = {}
+tenant_states: dict[str, dict[str, Any]] = {}
 _llm = None
 _embedder = None
 course_rag_cache: dict[str, list[dict[str, Any]]] = {}
@@ -69,7 +78,11 @@ chat_cond = asyncio.Condition(chat_lock)
 chat_queue: list[str] = []
 chat_active: set[str] = set()
 chat_sessions: dict[str, dict[str, Any]] = {}
-chat_prompts_session = 0
+chat_prompts_session_by_owner: dict[str, int] = {}
+users_lock = asyncio.Lock()
+users_db: dict[str, Any] = {"users": []}
+auth_sessions: dict[str, dict[str, Any]] = {}
+owner_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("owner_ctx", default="public")
 
 
 @app.middleware("http")
@@ -79,6 +92,94 @@ async def disable_http_cache(request: Request, call_next):
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
+
+def normalize_owner_id(raw: str) -> str:
+    owner = re.sub(r"[^a-zA-Z0-9._-]", "", str(raw or "").strip())
+    return owner or "public"
+
+
+def get_current_owner_id() -> str:
+    return normalize_owner_id(owner_ctx.get())
+
+
+def tenant_root(owner_id: Optional[str] = None) -> Path:
+    owner = normalize_owner_id(owner_id or get_current_owner_id())
+    return TENANTS_DIR / owner
+
+
+def tenant_courses_dir(owner_id: Optional[str] = None) -> Path:
+    return tenant_root(owner_id) / "courses"
+
+
+def tenant_state_file(owner_id: Optional[str] = None) -> Path:
+    return tenant_root(owner_id) / "state.json"
+
+
+def is_teacher_protected_path(path: str) -> bool:
+    if path.startswith("/api/auth/"):
+        return False
+    if path in {"/", "/favicon.ico"}:
+        return False
+    if path.startswith("/assets/"):
+        return False
+    protected_prefixes = (
+        "/api/courses",
+        "/api/whiteboards",
+        "/api/llm/config",
+    )
+    if any(path.startswith(prefix) for prefix in protected_prefixes):
+        return True
+    return False
+
+
+def owner_id_from_share_key(share_key: str) -> Optional[str]:
+    key = re.sub(r"[^a-zA-Z0-9_-]", "", str(share_key or "").strip())
+    if not key:
+        return None
+    for user in users_db.get("users", []):
+        if str(user.get("publicShareKey", "")) == key:
+            return str(user.get("id", ""))
+    return None
+
+
+def share_key_from_owner_id(owner_id: str) -> str:
+    owner = normalize_owner_id(owner_id)
+    for user in users_db.get("users", []):
+        if normalize_owner_id(str(user.get("id", ""))) == owner:
+            return str(user.get("publicShareKey", ""))
+    return ""
+
+
+def resolve_owner_from_request(request: Request) -> str:
+    user = current_user_from_request(request)
+    if user:
+        return normalize_owner_id(str(user.get("id", "")))
+    tenant_key = str(request.query_params.get("t", "") or request.query_params.get("tenant", "")).strip()
+    owner_from_key = owner_id_from_share_key(tenant_key)
+    if owner_from_key:
+        return normalize_owner_id(owner_from_key)
+    return "public"
+
+
+@app.middleware("http")
+async def bind_owner_context(request: Request, call_next):
+    owner = resolve_owner_from_request(request)
+    token = owner_ctx.set(owner)
+    try:
+        return await call_next(request)
+    finally:
+        owner_ctx.reset(token)
+
+
+@app.middleware("http")
+async def enforce_teacher_auth(request: Request, call_next):
+    path = request.url.path
+    if not is_teacher_protected_path(path):
+        return await call_next(request)
+    if current_user_from_request(request) is None:
+        return Response(content=json.dumps({"detail": "Authentification requise"}), media_type="application/json", status_code=401)
+    return await call_next(request)
 
 
 class CreateCourseBody(BaseModel):
@@ -152,6 +253,26 @@ class LlmConfigBody(BaseModel):
     apertusModel: str = ""
 
 
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class CreateUserBody(BaseModel):
+    username: str
+    password: str
+    isAdmin: bool = False
+
+
+class ChangePasswordBody(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
+class AdminSetPasswordBody(BaseModel):
+    newPassword: str
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -199,7 +320,7 @@ def default_llm_config() -> dict[str, Any]:
 
 
 def current_llm_config() -> dict[str, Any]:
-    cfg = state.get("llm", {}) if isinstance(state, dict) else {}
+    cfg = state.get("llm", {})
     provider = normalize_llm_provider(str(cfg.get("provider", default_llm_config()["provider"])))
     model = str(cfg.get("apertusModel", APERTUS_MODEL) or APERTUS_MODEL).strip()
     return {"provider": provider, "apertusModel": model}
@@ -221,8 +342,205 @@ def read_env_file_values(path: Path) -> dict[str, str]:
     return out
 
 
+def sanitize_username(value: str) -> str:
+    raw = (value or "").strip().lower()
+    raw = re.sub(r"[^a-z0-9._-]", "", raw)
+    return raw[:40]
+
+
+def _ensure_owner_state_loaded(owner_id: str) -> None:
+    owner = normalize_owner_id(owner_id)
+    if owner in tenant_states:
+        return
+    payload = load_state_from_disk(owner)
+    tenant_states[owner] = payload
+    token = owner_ctx.set(owner)
+    try:
+        ensure_active_consistency()
+        touch_and_save()
+    finally:
+        owner_ctx.reset(token)
+
+
+class TenantStateProxy:
+    def _data(self) -> dict[str, Any]:
+        owner = get_current_owner_id()
+        _ensure_owner_state_loaded(owner)
+        return tenant_states[owner]
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data()[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._data()[key] = value
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._data()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data().get(key, default)
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        return self._data().setdefault(key, default)
+
+    def clear(self) -> None:
+        self._data().clear()
+
+    def update(self, other: dict[str, Any]) -> None:
+        self._data().update(other)
+
+    def items(self):
+        return self._data().items()
+
+
+state: TenantStateProxy = TenantStateProxy()
+
+
+def hash_password(password: str, salt: str) -> str:
+    digest = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt.encode("utf-8"), 150_000)
+    return digest.hex()
+
+
+def verify_password(password: str, salt: str, expected_hash: str) -> bool:
+    got = hash_password(password, salt)
+    return hmac.compare_digest(got, expected_hash or "")
+
+
+def load_users_from_disk() -> dict[str, Any]:
+    if not USERS_FILE.exists():
+        return {"users": []}
+    try:
+        payload = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"users": []}
+    if not isinstance(payload, dict) or not isinstance(payload.get("users"), list):
+        return {"users": []}
+    out: list[dict[str, Any]] = []
+    for user in payload.get("users", []):
+        if not isinstance(user, dict):
+            continue
+        username = sanitize_username(str(user.get("username", "")))
+        if not username:
+            continue
+        out.append(
+            {
+                "id": str(user.get("id") or make_id("teacher")),
+                "username": username,
+                "passwordHash": str(user.get("passwordHash") or ""),
+                "passwordSalt": str(user.get("passwordSalt") or ""),
+                "isAdmin": bool(user.get("isAdmin", False)),
+                "publicShareKey": str(user.get("publicShareKey") or secrets.token_urlsafe(10)),
+                "createdAt": int(user.get("createdAt") or now_ms()),
+            }
+        )
+    return {"users": out}
+
+
+def save_users_to_disk() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    USERS_FILE.write_text(json.dumps(users_db, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def find_user_by_username(username: str) -> Optional[dict[str, Any]]:
+    uname = sanitize_username(username)
+    if not uname:
+        return None
+    for user in users_db.get("users", []):
+        if user.get("username") == uname:
+            return user
+    return None
+
+
+def ensure_default_admin_user() -> None:
+    if users_db.get("users"):
+        return
+    env_values = read_env_file_values(ENV_FILE)
+    username = sanitize_username(
+        os.environ.get("MAXBOARD_ADMIN_USER")
+        or env_values.get("MAXBOARD_ADMIN_USER")
+        or "admin"
+    )
+    password = (
+        os.environ.get("MAXBOARD_ADMIN_PASSWORD")
+        or env_values.get("MAXBOARD_ADMIN_PASSWORD")
+        or "maxboard"
+    )
+    salt = secrets.token_hex(16)
+    users_db["users"] = [
+        {
+            "id": make_id("teacher"),
+            "username": username or "admin",
+            "passwordHash": hash_password(password, salt),
+            "passwordSalt": salt,
+            "isAdmin": True,
+            "publicShareKey": secrets.token_urlsafe(10),
+            "createdAt": now_ms(),
+        }
+    ]
+    save_users_to_disk()
+
+
+def public_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(user.get("id", "")),
+        "username": str(user.get("username", "")),
+        "isAdmin": bool(user.get("isAdmin", False)),
+        "shareKey": str(user.get("publicShareKey", "")),
+        "createdAt": int(user.get("createdAt") or 0),
+    }
+
+
+def create_auth_session(user: dict[str, Any]) -> str:
+    token = secrets.token_urlsafe(32)
+    auth_sessions[token] = {
+        "userId": str(user.get("id", "")),
+        "username": str(user.get("username", "")),
+        "isAdmin": bool(user.get("isAdmin", False)),
+        "expiresAt": now_ms() + (AUTH_SESSION_TTL_SECONDS * 1000),
+    }
+    return token
+
+
+def get_session_from_token(token: str) -> Optional[dict[str, Any]]:
+    if not token:
+        return None
+    sess = auth_sessions.get(token)
+    if not sess:
+        return None
+    if int(sess.get("expiresAt") or 0) < now_ms():
+        auth_sessions.pop(token, None)
+        return None
+    return sess
+
+
+def current_user_from_request(request: Request) -> Optional[dict[str, Any]]:
+    token = request.cookies.get(AUTH_SESSION_COOKIE, "")
+    sess = get_session_from_token(token)
+    if not sess:
+        return None
+    return {
+        "id": str(sess.get("userId", "")),
+        "username": str(sess.get("username", "")),
+        "isAdmin": bool(sess.get("isAdmin", False)),
+    }
+
+
+def require_auth_user(request: Request) -> dict[str, Any]:
+    user = current_user_from_request(request)
+    if not user:
+        raise HTTPException(401, "Authentification requise")
+    return user
+
+
+def require_admin_user(request: Request) -> dict[str, Any]:
+    user = require_auth_user(request)
+    if not bool(user.get("isAdmin", False)):
+        raise HTTPException(403, "Droits administrateur requis")
+    return user
+
+
 def course_dir(course_id: str) -> Path:
-    return COURSES_DIR / str(course_id)
+    return tenant_courses_dir() / str(course_id)
 
 
 def course_pdf_dir(course_id: str) -> Path:
@@ -231,6 +549,10 @@ def course_pdf_dir(course_id: str) -> Path:
 
 def course_index_file(course_id: str) -> Path:
     return course_dir(course_id) / "pdf_index.json"
+
+
+def course_cache_key(course_id: str) -> str:
+    return f"{get_current_owner_id()}::{course_id}"
 
 
 def get_llm():
@@ -365,11 +687,12 @@ def split_text_chunks(text: str, chunk_size: int = 900, overlap: int = 140) -> l
 
 
 def load_course_index(course_id: str) -> list[dict[str, Any]]:
-    if course_id in course_rag_cache:
-        return course_rag_cache[course_id]
+    ckey = course_cache_key(course_id)
+    if ckey in course_rag_cache:
+        return course_rag_cache[ckey]
     idx_file = course_index_file(course_id)
     if not idx_file.exists():
-        course_rag_cache[course_id] = []
+        course_rag_cache[ckey] = []
         return []
     try:
         payload = json.loads(idx_file.read_text(encoding="utf-8"))
@@ -386,10 +709,10 @@ def load_course_index(course_id: str) -> list[dict[str, Any]]:
                 "vec": np.array(emb, dtype=np.float32),
             }
             hydrated.append(item)
-        course_rag_cache[course_id] = hydrated
+        course_rag_cache[ckey] = hydrated
         return hydrated
     except Exception:
-        course_rag_cache[course_id] = []
+        course_rag_cache[ckey] = []
         return []
 
 
@@ -462,17 +785,18 @@ def rebuild_course_index_sync(course_id: str) -> dict[str, Any]:
         ),
         encoding="utf-8",
     )
-    course_rag_cache.pop(course_id, None)
+    course_rag_cache.pop(course_cache_key(course_id), None)
     load_course_index(course_id)
     return {"fileCount": len(files), "chunkCount": len(collected)}
 
 
 async def rebuild_course_index(course_id: str) -> None:
-    pdf_reindex_state[course_id] = {"running": True, "error": "", "updatedAt": now_ms()}
+    pkey = course_cache_key(course_id)
+    pdf_reindex_state[pkey] = {"running": True, "error": "", "updatedAt": now_ms()}
     await broadcast({"type": "pdf_indexing", "courseId": course_id, "running": True, "error": ""})
     try:
         stats = await asyncio.to_thread(rebuild_course_index_sync, course_id)
-        pdf_reindex_state[course_id] = {"running": False, "error": "", "updatedAt": now_ms(), **stats}
+        pdf_reindex_state[pkey] = {"running": False, "error": "", "updatedAt": now_ms(), **stats}
         await broadcast(
             {
                 "type": "pdf_indexing",
@@ -484,56 +808,67 @@ async def rebuild_course_index(course_id: str) -> None:
             }
         )
     except Exception as exc:
-        pdf_reindex_state[course_id] = {"running": False, "error": str(exc), "updatedAt": now_ms()}
+        pdf_reindex_state[pkey] = {"running": False, "error": str(exc), "updatedAt": now_ms()}
         await broadcast({"type": "pdf_indexing", "courseId": course_id, "running": False, "error": str(exc)})
 
 
 def chat_supervision_payload() -> dict[str, Any]:
+    owner = get_current_owner_id()
+    queue_filtered = [sid for sid in chat_queue if str(chat_sessions.get(sid, {}).get("tenantId", "public")) == owner]
+    active_filtered = [sid for sid in sorted(chat_active) if str(chat_sessions.get(sid, {}).get("tenantId", "public")) == owner]
     queue_items = [
         {
             "sessionId": sid,
             "name": chat_sessions.get(sid, {}).get("studentName", "Étudiant"),
             "position": idx + 1,
         }
-        for idx, sid in enumerate(chat_queue)
+        for idx, sid in enumerate(queue_filtered)
     ]
     active_items = [
         {
             "sessionId": sid,
             "name": chat_sessions.get(sid, {}).get("studentName", "Étudiant"),
         }
-        for sid in sorted(chat_active)
+        for sid in active_filtered
     ]
     return {
-        "queueLength": len(chat_queue),
-        "activeCount": len(chat_active),
+        "queueLength": len(queue_filtered),
+        "activeCount": len(active_filtered),
         "queue": queue_items,
         "active": active_items,
-        "promptsSession": int(chat_prompts_session),
+        "promptsSession": int(chat_prompts_session_by_owner.get(owner, 0)),
         "promptsTotal": int(state.get("metrics", {}).get("promptsTotal", 0)),
     }
 
 
 def chat_session_payload(session_id: str) -> dict[str, Any]:
-    position = chat_queue.index(session_id) + 1 if session_id in chat_queue else 0
+    owner = get_current_owner_id()
+    queue_filtered = [sid for sid in chat_queue if str(chat_sessions.get(sid, {}).get("tenantId", "public")) == owner]
+    position = queue_filtered.index(session_id) + 1 if session_id in queue_filtered else 0
     return {
         "sessionId": session_id,
-        "active": session_id in chat_active,
+        "active": session_id in chat_active and str(chat_sessions.get(session_id, {}).get("tenantId", "public")) == owner,
         "position": position,
-        "queueLength": len(chat_queue),
+        "queueLength": len(queue_filtered),
     }
 
 
 async def acquire_chat_slot(session_id: str) -> None:
+    owner = get_current_owner_id()
     async with chat_cond:
         if session_id in chat_active:
             return
         if session_id not in chat_queue:
             chat_queue.append(session_id)
         while True:
-            can_take = len(chat_active) < CHAT_MAX_CONCURRENCY and chat_queue and chat_queue[0] == session_id
+            owner_active_count = sum(1 for sid in chat_active if str(chat_sessions.get(sid, {}).get("tenantId", "public")) == owner)
+            first_owner_queued = next(
+                (sid for sid in chat_queue if str(chat_sessions.get(sid, {}).get("tenantId", "public")) == owner),
+                None,
+            )
+            can_take = owner_active_count < CHAT_MAX_CONCURRENCY and first_owner_queued == session_id
             if can_take:
-                chat_queue.pop(0)
+                chat_queue.remove(session_id)
                 chat_active.add(session_id)
                 break
             await chat_cond.wait()
@@ -544,6 +879,10 @@ async def acquire_chat_slot(session_id: str) -> None:
 async def release_chat_slot(session_id: str, clear_history: bool = True) -> None:
     global chat_queue
     async with chat_cond:
+        if session_id in chat_sessions:
+            sid_owner = str(chat_sessions.get(session_id, {}).get("tenantId", "public"))
+            if sid_owner != get_current_owner_id():
+                return
         if session_id in chat_active:
             chat_active.remove(session_id)
         if session_id in chat_queue:
@@ -561,16 +900,20 @@ async def release_chat_slot(session_id: str, clear_history: bool = True) -> None
 async def chat_cleanup_loop() -> None:
     while True:
         await asyncio.sleep(5)
-        stale: list[str] = []
+        stale: list[tuple[str, str]] = []
         async with chat_lock:
             now = now_ms()
             for sid in list(chat_active):
                 sess = chat_sessions.get(sid, {})
                 last = int(sess.get("lastActivity", 0))
                 if now - last > CHAT_INACTIVITY_SECONDS * 1000:
-                    stale.append(sid)
-        for sid in stale:
-            await release_chat_slot(sid, clear_history=True)
+                    stale.append((sid, str(sess.get("tenantId", "public"))))
+        for sid, owner in stale:
+            token = owner_ctx.set(normalize_owner_id(owner))
+            try:
+                await release_chat_slot(sid, clear_history=True)
+            finally:
+                owner_ctx.reset(token)
 
 
 def build_chat_context(course_id: str, hotspot_title: str, hotspot_html: str, all_hotspots: list[dict[str, Any]], prompt: str) -> str:
@@ -636,11 +979,12 @@ def make_initial_state() -> dict[str, Any]:
     }
 
 
-def load_state_from_disk() -> dict[str, Any]:
-    if not STATE_FILE.exists():
+def load_state_from_disk(owner_id: Optional[str] = None) -> dict[str, Any]:
+    path = tenant_state_file(owner_id)
+    if not path.exists():
         return make_initial_state()
     try:
-        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return make_initial_state()
         if "courses" not in payload or "whiteboards" not in payload:
@@ -657,9 +1001,15 @@ def load_state_from_disk() -> dict[str, Any]:
         return make_initial_state()
 
 
-def save_state_to_disk() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_state_to_disk(owner_id: Optional[str] = None) -> None:
+    owner = normalize_owner_id(owner_id or get_current_owner_id())
+    root = tenant_root(owner)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = tenant_states.get(owner)
+    if payload is None:
+        payload = make_initial_state()
+        tenant_states[owner] = payload
+    tenant_state_file(owner).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def get_course(course_id: str) -> dict[str, Any]:
@@ -790,8 +1140,13 @@ async def send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
 
 
 async def broadcast(payload: dict[str, Any], exclude: Optional[WebSocket] = None) -> None:
+    owner = get_current_owner_id()
     async with clients_lock:
-        targets = [ws for ws in clients if ws is not exclude]
+        targets = [
+            ws
+            for ws in clients
+            if ws is not exclude and normalize_owner_id(client_tenants.get(id(ws), "public")) == owner
+        ]
     if not targets:
         return
     text = json.dumps(payload)
@@ -803,16 +1158,19 @@ async def broadcast(payload: dict[str, Any], exclude: Optional[WebSocket] = None
 
 
 async def broadcast_users() -> None:
+    owner = get_current_owner_id()
     async with clients_lock:
-        count = len(clients)
-        students = sum(1 for ws in clients if client_roles.get(id(ws), "student") == "student")
+        owned = [ws for ws in clients if normalize_owner_id(client_tenants.get(id(ws), "public")) == owner]
+        count = len(owned)
+        students = sum(1 for ws in owned if client_roles.get(id(ws), "student") == "student")
+    prompts_session = int(chat_prompts_session_by_owner.get(owner, 0))
     await broadcast(
         {
             "type": "users",
             "count": count,
             "students": students,
-            "queue": len(chat_queue),
-            "promptsSession": int(chat_prompts_session),
+            "queue": int(chat_supervision_payload().get("queueLength", 0)),
+            "promptsSession": prompts_session,
         }
     )
 
@@ -829,11 +1187,11 @@ async def broadcast_catalog_and_active() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global state
-    state = load_state_from_disk()
-    COURSES_DIR.mkdir(parents=True, exist_ok=True)
-    ensure_active_consistency()
-    touch_and_save()
+    global users_db
+    users_db = load_users_from_disk()
+    ensure_default_admin_user()
+    save_users_to_disk()
+    TENANTS_DIR.mkdir(parents=True, exist_ok=True)
     asyncio.create_task(chat_cleanup_loop())
 
 
@@ -842,19 +1200,162 @@ async def root() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
 
 
+@app.get("/api/auth/me")
+async def auth_me(request: Request) -> dict[str, Any]:
+    user = current_user_from_request(request)
+    return {"authenticated": bool(user), "user": user or None}
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginBody) -> Response:
+    username = sanitize_username(body.username)
+    password = str(body.password or "")
+    if not username or not password:
+        raise HTTPException(400, "Identifiants invalides")
+    async with users_lock:
+        user = find_user_by_username(username)
+        if not user:
+            raise HTTPException(401, "Utilisateur ou mot de passe invalide")
+        if not verify_password(password, str(user.get("passwordSalt", "")), str(user.get("passwordHash", ""))):
+            raise HTTPException(401, "Utilisateur ou mot de passe invalide")
+        token = create_auth_session(user)
+    payload = {"ok": True, "user": public_user(user)}
+    resp = Response(content=json.dumps(payload), media_type="application/json")
+    resp.set_cookie(
+        key=AUTH_SESSION_COOKIE,
+        value=token,
+        max_age=AUTH_SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request) -> Response:
+    token = request.cookies.get(AUTH_SESSION_COOKIE, "")
+    if token:
+        auth_sessions.pop(token, None)
+    resp = Response(content=json.dumps({"ok": True}), media_type="application/json")
+    resp.delete_cookie(AUTH_SESSION_COOKIE)
+    return resp
+
+
+@app.post("/api/auth/change-password")
+async def auth_change_password(request: Request, body: ChangePasswordBody) -> dict[str, Any]:
+    current = require_auth_user(request)
+    current_password = str(body.currentPassword or "")
+    new_password = str(body.newPassword or "")
+    if len(new_password) < 6:
+        raise HTTPException(400, "Nouveau mot de passe trop court (min 6)")
+    async with users_lock:
+        user = find_user_by_username(str(current.get("username", "")))
+        if not user:
+            raise HTTPException(404, "Utilisateur introuvable")
+        if not verify_password(current_password, str(user.get("passwordSalt", "")), str(user.get("passwordHash", ""))):
+            raise HTTPException(401, "Mot de passe actuel incorrect")
+        salt = secrets.token_hex(16)
+        user["passwordSalt"] = salt
+        user["passwordHash"] = hash_password(new_password, salt)
+        save_users_to_disk()
+    return {"ok": True}
+
+
+@app.get("/api/auth/users")
+async def auth_users_list(request: Request) -> dict[str, Any]:
+    _ = require_admin_user(request)
+    async with users_lock:
+        users = [public_user(u) for u in users_db.get("users", [])]
+    return {"users": users}
+
+
+@app.post("/api/auth/users")
+async def auth_users_create(request: Request, body: CreateUserBody) -> dict[str, Any]:
+    _ = require_admin_user(request)
+    username = sanitize_username(body.username)
+    password = str(body.password or "")
+    if len(username) < 3:
+        raise HTTPException(400, "Nom d'utilisateur trop court")
+    if len(password) < 6:
+        raise HTTPException(400, "Mot de passe trop court (min 6)")
+    async with users_lock:
+        if find_user_by_username(username):
+            raise HTTPException(409, "Utilisateur déjà existant")
+        salt = secrets.token_hex(16)
+        user = {
+            "id": make_id("teacher"),
+            "username": username,
+            "passwordHash": hash_password(password, salt),
+            "passwordSalt": salt,
+            "isAdmin": bool(body.isAdmin),
+            "publicShareKey": secrets.token_urlsafe(10),
+            "createdAt": now_ms(),
+        }
+        users_db.setdefault("users", []).append(user)
+        save_users_to_disk()
+    return {"ok": True, "user": public_user(user)}
+
+
+@app.post("/api/auth/users/{username}/password")
+async def auth_users_set_password(username: str, request: Request, body: AdminSetPasswordBody) -> dict[str, Any]:
+    _ = require_admin_user(request)
+    target = sanitize_username(username)
+    if len(target) < 3:
+        raise HTTPException(400, "Nom d'utilisateur invalide")
+    new_password = str(body.newPassword or "")
+    if len(new_password) < 6:
+        raise HTTPException(400, "Mot de passe trop court (min 6)")
+    async with users_lock:
+        user = find_user_by_username(target)
+        if not user:
+            raise HTTPException(404, "Utilisateur introuvable")
+        salt = secrets.token_hex(16)
+        user["passwordSalt"] = salt
+        user["passwordHash"] = hash_password(new_password, salt)
+        save_users_to_disk()
+    return {"ok": True}
+
+
+@app.delete("/api/auth/users/{username}")
+async def auth_users_delete(username: str, request: Request) -> dict[str, Any]:
+    current = require_admin_user(request)
+    target = sanitize_username(username)
+    if not target:
+        raise HTTPException(400, "Nom d'utilisateur invalide")
+    if target == str(current.get("username", "")):
+        raise HTTPException(400, "Impossible de supprimer votre propre compte")
+    async with users_lock:
+        before = len(users_db.get("users", []))
+        users_db["users"] = [u for u in users_db.get("users", []) if u.get("username") != target]
+        if len(users_db["users"]) == before:
+            raise HTTPException(404, "Utilisateur introuvable")
+        if not any(bool(u.get("isAdmin")) for u in users_db["users"]):
+            raise HTTPException(400, "Au moins un administrateur doit rester")
+        save_users_to_disk()
+    return {"ok": True}
+
+
 @app.get("/api/bootstrap")
-async def api_bootstrap() -> dict[str, Any]:
+async def api_bootstrap(request: Request) -> dict[str, Any]:
     host = detect_local_ip()
     course_id = state.get("activeCourseId", "")
     llm_cfg = current_llm_config()
+    auth_user = current_user_from_request(request)
+    owner_id = get_current_owner_id()
+    tenant_key = share_key_from_owner_id(owner_id)
+    if not tenant_key:
+        tenant_key = str(request.query_params.get("t", "") or request.query_params.get("tenant", "")).strip()
     return {
         "state": public_state(),
         "activeBoard": active_board_payload(),
         "shareBaseUrl": f"http://{host}:{PORT}",
-        "pdfIndexing": pdf_reindex_state.get(course_id, {"running": False, "error": "", "updatedAt": 0}),
+        "tenantKey": tenant_key,
+        "pdfIndexing": pdf_reindex_state.get(course_cache_key(course_id), {"running": False, "error": "", "updatedAt": 0}),
         "chatSupervision": chat_supervision_payload(),
         "llmProvider": llm_cfg["provider"],
         "llmConfig": llm_cfg,
+        "auth": {"authenticated": bool(auth_user), "user": auth_user},
     }
 
 
@@ -1143,7 +1644,7 @@ async def list_course_pdfs(course_id: str) -> dict[str, Any]:
         for p in files:
             st = p.stat()
             rows.append({"name": p.name, "size": int(st.st_size), "updatedAt": int(st.st_mtime * 1000)})
-        status = pdf_reindex_state.get(course["id"], {"running": False, "error": "", "updatedAt": 0})
+        status = pdf_reindex_state.get(course_cache_key(course["id"]), {"running": False, "error": "", "updatedAt": 0})
     return {"courseId": course_id, "files": rows, "indexing": status}
 
 
@@ -1332,7 +1833,6 @@ async def chat_release(body: ChatReleaseBody) -> dict[str, Any]:
 
 @app.post("/api/chat/hotspot")
 async def chat_hotspot(body: ChatAskBody) -> dict[str, Any]:
-    global chat_prompts_session
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(400, "Prompt vide")
@@ -1341,7 +1841,11 @@ async def chat_hotspot(body: ChatAskBody) -> dict[str, Any]:
     if not session_id:
         raise HTTPException(400, "sessionId requis")
     name = sanitize_name(body.studentName, "Étudiant")
+    owner = get_current_owner_id()
     async with chat_lock:
+        existing = chat_sessions.get(session_id)
+        if existing and str(existing.get("tenantId", "public")) != owner:
+            raise HTTPException(403, "Session chat invalide pour ce tenant")
         sess = chat_sessions.setdefault(
             session_id,
             {
@@ -1351,12 +1855,14 @@ async def chat_hotspot(body: ChatAskBody) -> dict[str, Any]:
                 "courseId": body.courseId,
                 "whiteboardId": body.whiteboardId,
                 "hotspotId": body.hotspotId,
+                "tenantId": owner,
             },
         )
         sess["studentName"] = name
         sess["courseId"] = body.courseId
         sess["whiteboardId"] = body.whiteboardId
         sess["hotspotId"] = body.hotspotId
+        sess["tenantId"] = owner
         sess["lastActivity"] = now_ms()
 
     await acquire_chat_slot(session_id)
@@ -1373,7 +1879,7 @@ async def chat_hotspot(body: ChatAskBody) -> dict[str, Any]:
             sess = chat_sessions[session_id]
             history = list(sess.get("history", []))[-8:]
             sess["history"] = history
-            chat_prompts_session += 1
+            chat_prompts_session_by_owner[owner] = int(chat_prompts_session_by_owner.get(owner, 0)) + 1
         async with state_lock:
             state.setdefault("metrics", {})
             state["metrics"]["promptsTotal"] = int(state["metrics"].get("promptsTotal", 0)) + 1
@@ -1419,12 +1925,31 @@ async def chat_hotspot(body: ChatAskBody) -> dict[str, Any]:
 
 @app.websocket("/ws/live")
 async def ws_live(websocket: WebSocket, role: str = "student") -> None:
+    tenant_owner = "public"
+    if role != "student":
+        token = websocket.cookies.get(AUTH_SESSION_COOKIE, "")
+        sess = get_session_from_token(token)
+        if sess is None:
+            await websocket.close(code=4401)
+            return
+        tenant_owner = normalize_owner_id(str(sess.get("userId", "")))
+    else:
+        tenant_key = str(websocket.query_params.get("t", "") or websocket.query_params.get("tenant", "")).strip()
+        owner = owner_id_from_share_key(tenant_key)
+        if not owner:
+            await websocket.close(code=4401)
+            return
+        tenant_owner = normalize_owner_id(owner)
+
+    token_owner = owner_ctx.set(tenant_owner)
     await websocket.accept()
     async with clients_lock:
         clients.append(websocket)
         client_roles[id(websocket)] = role
-        users_count = len(clients)
-        students_count = sum(1 for ws in clients if client_roles.get(id(ws), "student") == "student")
+        client_tenants[id(websocket)] = tenant_owner
+        owned = [ws for ws in clients if normalize_owner_id(client_tenants.get(id(ws), "public")) == tenant_owner]
+        users_count = len(owned)
+        students_count = sum(1 for ws in owned if client_roles.get(id(ws), "student") == "student")
 
     await send_json(
         websocket,
@@ -1435,7 +1960,7 @@ async def ws_live(websocket: WebSocket, role: str = "student") -> None:
             "activeBoard": active_board_payload(),
             "users": users_count,
             "students": students_count,
-            "pdfIndexing": pdf_reindex_state.get(state.get("activeCourseId", ""), {"running": False, "error": "", "updatedAt": 0}),
+            "pdfIndexing": pdf_reindex_state.get(course_cache_key(state.get("activeCourseId", "")), {"running": False, "error": "", "updatedAt": 0}),
             "chatSupervision": chat_supervision_payload(),
         },
     )
@@ -1540,7 +2065,9 @@ async def ws_live(websocket: WebSocket, role: str = "student") -> None:
             if websocket in clients:
                 clients.remove(websocket)
             client_roles.pop(id(websocket), None)
+            client_tenants.pop(id(websocket), None)
         await broadcast_users()
+        owner_ctx.reset(token_owner)
 
 
 app.mount("/assets", StaticFiles(directory=str(WEB_DIR / "assets")), name="assets")

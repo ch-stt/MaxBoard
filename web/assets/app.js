@@ -2,6 +2,7 @@
   const params = new URLSearchParams(location.search);
   const mode = params.get("mode") === "student" ? "student" : "teacher";
   const isTeacher = mode === "teacher";
+  const tenantFromUrl = String(params.get("t") || params.get("tenant") || "").trim();
   const clientId = "c_" + Math.random().toString(36).slice(2, 10);
   const logical = { w: 1600, h: 900 };
 
@@ -90,12 +91,27 @@
     llmApertusModelInput: document.getElementById("llm-apertus-model-input"),
     llmSaveBtn: document.getElementById("llm-save-btn"),
     llmCloseBtn: document.getElementById("llm-close-btn"),
+    passwordDialog: document.getElementById("password-dialog"),
+    pwdCurrentInput: document.getElementById("pwd-current-input"),
+    pwdNewInput: document.getElementById("pwd-new-input"),
+    pwdConfirmInput: document.getElementById("pwd-confirm-input"),
+    pwdSaveBtn: document.getElementById("pwd-save-btn"),
+    pwdCloseBtn: document.getElementById("pwd-close-btn"),
+    usersDialog: document.getElementById("users-dialog"),
+    usersList: document.getElementById("users-list"),
+    usersRefreshBtn: document.getElementById("users-refresh-btn"),
+    newUserNameInput: document.getElementById("new-user-name-input"),
+    newUserPasswordInput: document.getElementById("new-user-password-input"),
+    newUserAdminInput: document.getElementById("new-user-admin-input"),
+    usersCreateBtn: document.getElementById("users-create-btn"),
+    usersCloseBtn: document.getElementById("users-close-btn"),
     barkAudio: document.getElementById("bark-audio"),
     status: document.getElementById("status"),
   };
 
   const state = {
     shareBaseUrl: location.origin,
+    tenantKey: tenantFromUrl,
     catalog: null,
     activeBoard: null,
     ws: null,
@@ -141,6 +157,11 @@
     llm: {
       provider: "local",
       apertusModel: "",
+    },
+    auth: {
+      authenticated: false,
+      user: null,
+      users: [],
     },
     pinch: null,
     imageCache: {},
@@ -347,6 +368,65 @@
     els.llmApertusModelInput.disabled = provider !== "apertus";
   }
 
+  function renderUsersDialog() {
+    if (!els.usersList) return;
+    const users = Array.isArray(state.auth.users) ? state.auth.users : [];
+    if (!users.length) {
+      els.usersList.innerHTML = "<div class='list-item'>Aucun prof.</div>";
+      return;
+    }
+    els.usersList.innerHTML = "";
+    users
+      .slice()
+      .sort((a, b) => String(a.username || "").localeCompare(String(b.username || "")))
+      .forEach((u) => {
+        const row = document.createElement("div");
+        row.className = "list-item";
+        const role = u.isAdmin ? "admin" : "prof";
+        row.textContent = `${u.username} (${role})`;
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+
+        const resetBtn = document.createElement("button");
+        resetBtn.className = "btn";
+        resetBtn.textContent = "Reset mdp";
+        resetBtn.onclick = async () => {
+          const nextPwd = prompt(`Nouveau mot de passe pour ${u.username} ?`, "");
+          if (!nextPwd) return;
+          await api(`/api/auth/users/${encodeURIComponent(u.username)}/password`, {
+            method: "POST",
+            body: JSON.stringify({ newPassword: nextPwd }),
+          });
+          setStatus(`Mot de passe changé pour ${u.username}`);
+        };
+        actions.appendChild(resetBtn);
+
+        const me = state.auth.user && String(state.auth.user.username || "") === String(u.username || "");
+        if (!me) {
+          const delBtn = document.createElement("button");
+          delBtn.className = "btn danger";
+          delBtn.textContent = "Supprimer";
+          delBtn.onclick = async () => {
+            if (!confirm(`Supprimer le compte ${u.username} ?`)) return;
+            await api(`/api/auth/users/${encodeURIComponent(u.username)}`, { method: "DELETE" });
+            await loadUsersForAdmin();
+          };
+          actions.appendChild(delBtn);
+        }
+
+        row.appendChild(actions);
+        els.usersList.appendChild(row);
+      });
+  }
+
+  async function loadUsersForAdmin() {
+    if (!state.auth.user || !state.auth.user.isAdmin) return;
+    const out = await api("/api/auth/users");
+    state.auth.users = Array.isArray(out && out.users) ? out.users : [];
+    renderUsersDialog();
+  }
+
   function updateChatQueueStatus() {
     const q = state.chat.queue || { active: false, position: 0, queueLength: 0 };
     if (q.active) {
@@ -394,18 +474,64 @@
   }
 
   function api(path, opts = {}) {
-    return fetch(path, {
+    let url = String(path || "");
+    if (url.startsWith("/api/") && state.tenantKey) {
+      const hasQuery = url.includes("?");
+      const hasTenant = /[?&](t|tenant)=/.test(url);
+      if (!hasTenant) {
+        url += `${hasQuery ? "&" : "?"}t=${encodeURIComponent(state.tenantKey)}`;
+      }
+    }
+    return fetch(url, {
       headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      credentials: "same-origin",
       ...opts,
     }).then(async (r) => {
       if (!r.ok) {
         const txt = await r.text();
-        throw new Error(txt || `HTTP ${r.status}`);
+        let detail = txt;
+        try {
+          const payload = JSON.parse(txt || "{}");
+          if (payload && payload.detail) detail = String(payload.detail);
+        } catch (_err) {}
+        throw new Error(detail || `HTTP ${r.status}`);
       }
       const ctype = r.headers.get("content-type") || "";
       if (ctype.includes("application/json")) return r.json();
       return r.blob();
     });
+  }
+
+  async function ensureTeacherAuth() {
+    if (!isTeacher) return;
+    while (true) {
+      let me = null;
+      try {
+        me = await api("/api/auth/me");
+      } catch (_err) {
+        me = { authenticated: false };
+      }
+      if (me && me.authenticated) {
+        state.auth.authenticated = true;
+        state.auth.user = me.user || null;
+        return;
+      }
+      const username = prompt("Connexion Prof - Nom d'utilisateur", "");
+      if (!username) throw new Error("Connexion requise pour le mode Prof");
+      const password = prompt("Connexion Prof - Mot de passe", "");
+      if (!password) throw new Error("Connexion requise pour le mode Prof");
+      try {
+        const out = await api("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ username, password }),
+        });
+        state.auth.authenticated = Boolean(out && out.ok);
+        state.auth.user = out && out.user ? out.user : null;
+        return;
+      } catch (e) {
+        alert(`Connexion refusée: ${e.message}`);
+      }
+    }
   }
 
   function activeCourse() {
@@ -712,7 +838,8 @@
 
   function connectWs() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/live?role=${isTeacher ? "teacher" : "student"}`);
+    const tenantQ = state.tenantKey ? `&t=${encodeURIComponent(state.tenantKey)}` : "";
+    const ws = new WebSocket(`${proto}://${location.host}/ws/live?role=${isTeacher ? "teacher" : "student"}${tenantQ}`);
     state.ws = ws;
     ws.onopen = () => setStatus("Connecté");
     ws.onclose = () => {
@@ -876,10 +1003,11 @@
   }
 
   function openShare(kind) {
+    const tk = state.tenantKey ? `&t=${encodeURIComponent(state.tenantKey)}` : "";
     const url =
       kind === "student"
-        ? `${state.shareBaseUrl}/?mode=student`
-        : `${state.shareBaseUrl}/?mode=teacher&remote=1`;
+        ? `${state.shareBaseUrl}/?mode=student${tk}`
+        : `${state.shareBaseUrl}/?mode=teacher&remote=1${tk}`;
     els.shareTitle.textContent = kind === "student" ? "QR consultation etudiants" : "QR edition prof";
     els.shareUrl.value = url;
     els.shareQr.src = `/api/qr?url=${encodeURIComponent(url)}`;
@@ -1360,6 +1488,105 @@
         pdfEntry.dataset.role = "pdf-entry";
         els.burgerMenu.insertBefore(pdfEntry, els.resetViewBtn);
       }
+
+      if (!els.burgerMenu.querySelector("[data-role='logout-entry']")) {
+        const logoutEntry = document.createElement("button");
+        logoutEntry.className = "menu-item";
+        logoutEntry.dataset.role = "logout-entry";
+        logoutEntry.textContent = "Se déconnecter";
+        logoutEntry.onclick = async () => {
+          await api("/api/auth/logout", { method: "POST" });
+          location.reload();
+        };
+        els.burgerMenu.appendChild(logoutEntry);
+      }
+
+      if (!els.burgerMenu.querySelector("[data-role='password-entry']")) {
+        const pwdEntry = document.createElement("button");
+        pwdEntry.className = "menu-item";
+        pwdEntry.dataset.role = "password-entry";
+        pwdEntry.textContent = "Changer mon mot de passe";
+        pwdEntry.onclick = () => {
+          if (!els.passwordDialog) return;
+          els.pwdCurrentInput.value = "";
+          els.pwdNewInput.value = "";
+          els.pwdConfirmInput.value = "";
+          els.passwordDialog.showModal();
+          els.burgerMenu.classList.add("hidden");
+        };
+        els.burgerMenu.appendChild(pwdEntry);
+      }
+
+      if (state.auth.user && state.auth.user.isAdmin && !els.burgerMenu.querySelector("[data-role='users-entry']")) {
+        const usersEntry = document.createElement("button");
+        usersEntry.className = "menu-item";
+        usersEntry.dataset.role = "users-entry";
+        usersEntry.textContent = "Gestion des profs";
+        usersEntry.onclick = async () => {
+          await loadUsersForAdmin();
+          els.usersDialog.showModal();
+          els.burgerMenu.classList.add("hidden");
+        };
+        els.burgerMenu.appendChild(usersEntry);
+      }
+    }
+
+    if (els.pwdSaveBtn && els.passwordDialog) {
+      els.pwdSaveBtn.onclick = async () => {
+        try {
+          const currentPassword = String(els.pwdCurrentInput.value || "");
+          const newPassword = String(els.pwdNewInput.value || "");
+          const confirmPassword = String(els.pwdConfirmInput.value || "");
+          if (!currentPassword || !newPassword) {
+            alert("Veuillez remplir les champs mot de passe.");
+            return;
+          }
+          if (newPassword !== confirmPassword) {
+            alert("La confirmation ne correspond pas.");
+            return;
+          }
+          await api("/api/auth/change-password", {
+            method: "POST",
+            body: JSON.stringify({ currentPassword, newPassword }),
+          });
+          els.passwordDialog.close();
+          setStatus("Mot de passe changé");
+          alert("Mot de passe changé.");
+        } catch (e) {
+          alert(`Impossible de changer le mot de passe: ${e.message || e}`);
+        }
+      };
+    }
+    if (els.pwdCloseBtn && els.passwordDialog) {
+      els.pwdCloseBtn.onclick = () => els.passwordDialog.close();
+    }
+
+    if (els.usersRefreshBtn) {
+      els.usersRefreshBtn.onclick = () => {
+        loadUsersForAdmin().catch((e) => alert(e.message));
+      };
+    }
+    if (els.usersCreateBtn) {
+      els.usersCreateBtn.onclick = async () => {
+        const username = String(els.newUserNameInput.value || "").trim();
+        const password = String(els.newUserPasswordInput.value || "");
+        const isAdminUser = Boolean(els.newUserAdminInput.checked);
+        if (!username || !password) {
+          alert("Nom d'utilisateur et mot de passe requis.");
+          return;
+        }
+        await api("/api/auth/users", {
+          method: "POST",
+          body: JSON.stringify({ username, password, isAdmin: isAdminUser }),
+        });
+        els.newUserNameInput.value = "";
+        els.newUserPasswordInput.value = "";
+        els.newUserAdminInput.checked = false;
+        await loadUsersForAdmin();
+      };
+    }
+    if (els.usersCloseBtn && els.usersDialog) {
+      els.usersCloseBtn.onclick = () => els.usersDialog.close();
     }
     els.importWbInput.onchange = async () => {
       const file = els.importWbInput.files && els.importWbInput.files[0];
@@ -1537,7 +1764,8 @@
       if (!c || !f) return;
       const form = new FormData();
       form.append("file", f);
-      const r = await fetch(`/api/courses/${c.id}/pdfs/upload`, { method: "POST", body: form });
+      const tk = state.tenantKey ? `?t=${encodeURIComponent(state.tenantKey)}` : "";
+      const r = await fetch(`/api/courses/${c.id}/pdfs/upload${tk}`, { method: "POST", body: form, credentials: "same-origin" });
       if (!r.ok) {
         const txt = await r.text();
         alert(txt || `Upload impossible (${r.status})`);
@@ -1748,12 +1976,18 @@
 
   async function init() {
     ensureLlmUi();
+    await ensureTeacherAuth();
     setTeacherVisibility();
     setupEvents();
     const data = await api("/api/bootstrap");
     state.shareBaseUrl = data.shareBaseUrl || location.origin;
+    if (data.tenantKey) state.tenantKey = String(data.tenantKey || "");
     if (data.chatSupervision) state.supervision = data.chatSupervision;
     if (data.pdfIndexing) state.pdfs.indexing = data.pdfIndexing;
+    if (data.auth) {
+      state.auth.authenticated = Boolean(data.auth.authenticated);
+      state.auth.user = data.auth.user || null;
+    }
     if (data.llmConfig) {
       state.llm = {
         provider: data.llmConfig.provider === "apertus" ? "apertus" : "local",
