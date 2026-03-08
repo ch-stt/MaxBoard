@@ -45,3 +45,21 @@ Puis ouvrir:
 - Modele par defaut: `/Users/stt/GIT/models/qwen2.5-3b-instruct-q4_k_m.gguf`
 - Override possible avec `MAXBOARD_MODEL_PATH`
 - Embeddings RAG: `BAAI/bge-small-en-v1.5` (fastembed)
+
+## IA Apertus (Infomaniak)
+
+Provider selectable via env:
+
+- `MAXBOARD_LLM_PROVIDER=local|apertus` (defaut `local`)
+- `MAXBOARD_APERTUS_MODEL` (defaut `meta-llama/Llama-3.3-70B-Instruct`)
+- Option 1 (URL explicite): `MAXBOARD_APERTUS_API_URL` + `MAXBOARD_INFOMANIAK_API_TOKEN`
+- Option 2 (derivee Infomaniak): `MAXBOARD_INFOMANIAK_PRODUCT_ID` + `MAXBOARD_INFOMANIAK_API_TOKEN`
+
+Exemple:
+
+```bash
+export MAXBOARD_LLM_PROVIDER=apertus
+export MAXBOARD_INFOMANIAK_PRODUCT_ID=XXXXX
+export MAXBOARD_INFOMANIAK_API_TOKEN=sk-xxxxx
+python server.py
+```

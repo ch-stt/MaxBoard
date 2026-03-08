@@ -16,8 +16,9 @@ from uuid import uuid4
 
 import numpy as np
 import qrcode
+import requests
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,6 +33,7 @@ WEB_DIR = ROOT / "web"
 DATA_DIR = ROOT / "data"
 COURSES_DIR = DATA_DIR / "courses"
 STATE_FILE = DATA_DIR / "state.json"
+ENV_FILE = ROOT / ".env"
 PORT = 8080
 CHAT_MAX_CONCURRENCY = 5
 CHAT_INACTIVITY_SECONDS = 30
@@ -43,6 +45,12 @@ MODEL_PATH = Path(
     else "/Users/stt/GIT/models/qwen2.5-3b-instruct-q4_k_m.gguf"
 )
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+LLM_PROVIDER = (os.environ.get("MAXBOARD_LLM_PROVIDER", "local") or "local").strip().lower()
+APERTUS_REMOTE_API_URL = (os.environ.get("MAXBOARD_APERTUS_API_URL", "") or "").strip()
+APERTUS_REMOTE_API_KEY = (os.environ.get("MAXBOARD_APERTUS_API_KEY", "") or "").strip()
+INFOMANIAK_PRODUCT_ID = (os.environ.get("MAXBOARD_INFOMANIAK_PRODUCT_ID", "") or "").strip()
+INFOMANIAK_API_TOKEN = (os.environ.get("MAXBOARD_INFOMANIAK_API_TOKEN", "") or "").strip()
+APERTUS_MODEL = (os.environ.get("MAXBOARD_APERTUS_MODEL", "meta-llama/Llama-3.3-70B-Instruct") or "meta-llama/Llama-3.3-70B-Instruct").strip()
 
 
 app = FastAPI(title="MaxBoard")
@@ -62,6 +70,15 @@ chat_queue: list[str] = []
 chat_active: set[str] = set()
 chat_sessions: dict[str, dict[str, Any]] = {}
 chat_prompts_session = 0
+
+
+@app.middleware("http")
+async def disable_http_cache(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 class CreateCourseBody(BaseModel):
@@ -130,6 +147,11 @@ class ChatReleaseBody(BaseModel):
     sessionId: str
 
 
+class LlmConfigBody(BaseModel):
+    provider: str = "local"
+    apertusModel: str = ""
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -164,6 +186,41 @@ def sanitize_filename(name: str, fallback: str = "document.pdf") -> str:
     return raw[:180]
 
 
+def normalize_llm_provider(raw: str) -> str:
+    v = (raw or "").strip().lower()
+    return v if v in {"local", "apertus"} else "local"
+
+
+def default_llm_config() -> dict[str, Any]:
+    return {
+        "provider": normalize_llm_provider(LLM_PROVIDER),
+        "apertusModel": APERTUS_MODEL,
+    }
+
+
+def current_llm_config() -> dict[str, Any]:
+    cfg = state.get("llm", {}) if isinstance(state, dict) else {}
+    provider = normalize_llm_provider(str(cfg.get("provider", default_llm_config()["provider"])))
+    model = str(cfg.get("apertusModel", APERTUS_MODEL) or APERTUS_MODEL).strip()
+    return {"provider": provider, "apertusModel": model}
+
+
+def read_env_file_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+    except Exception:
+        return {}
+    return out
+
+
 def course_dir(course_id: str) -> Path:
     return COURSES_DIR / str(course_id)
 
@@ -188,6 +245,93 @@ def get_llm():
         raise HTTPException(503, f"llama-cpp-python indisponible: {exc}")
     _llm = Llama(model_path=str(MODEL_PATH), n_ctx=8192, n_gpu_layers=-1, verbose=False)
     return _llm
+
+
+def resolve_apertus_url() -> str:
+    if APERTUS_REMOTE_API_URL:
+        return APERTUS_REMOTE_API_URL.rstrip("/")
+    if INFOMANIAK_PRODUCT_ID:
+        return f"https://api.infomaniak.com/1/ai/{INFOMANIAK_PRODUCT_ID}/openai"
+    env_values = read_env_file_values(ENV_FILE)
+    file_remote = (
+        env_values.get("MAXBOARD_APERTUS_API_URL")
+        or env_values.get("KIRALM_REMOTE_API_URL")
+        or ""
+    ).strip()
+    if file_remote:
+        return file_remote.rstrip("/")
+    file_product_id = (
+        env_values.get("MAXBOARD_INFOMANIAK_PRODUCT_ID")
+        or env_values.get("KIRALM_INFOMANIAK_PRODUCT_ID")
+        or ""
+    ).strip()
+    if file_product_id:
+        return f"https://api.infomaniak.com/1/ai/{file_product_id}/openai"
+    return ""
+
+
+def resolve_apertus_api_key() -> str:
+    in_memory = (APERTUS_REMOTE_API_KEY or INFOMANIAK_API_TOKEN).strip()
+    if in_memory:
+        return in_memory
+    env_values = read_env_file_values(ENV_FILE)
+    return (
+        env_values.get("MAXBOARD_APERTUS_API_KEY")
+        or env_values.get("MAXBOARD_INFOMANIAK_API_TOKEN")
+        or env_values.get("KIRALM_REMOTE_API_KEY")
+        or env_values.get("KIRALM_INFOMANIAK_API_TOKEN")
+        or ""
+    ).strip()
+
+
+def chat_completion_apertus(messages: list[dict[str, str]], model_name: str) -> str:
+    base = resolve_apertus_url()
+    api_key = resolve_apertus_api_key()
+    if not base:
+        raise HTTPException(503, "Apertus non configuré: URL absente")
+    if not api_key:
+        raise HTTPException(503, "Apertus non configuré: token API absent")
+    endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    adapted_messages: list[dict[str, str]] = []
+    system_parts: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "")).strip().lower()
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+            continue
+        if role in {"user", "assistant"}:
+            adapted_messages.append({"role": role, "content": content})
+    if system_parts:
+        preamble = "Contexte et consignes:\n" + "\n\n".join(system_parts)
+        adapted_messages.insert(0, {"role": "user", "content": preamble})
+    if not adapted_messages:
+        adapted_messages = [{"role": "user", "content": "Bonjour"}]
+
+    payload = {
+        "model": model_name or APERTUS_MODEL,
+        "messages": adapted_messages,
+        "temperature": 0.2,
+        "max_tokens": 500,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+    except Exception as exc:
+        raise HTTPException(502, f"Erreur réseau Apertus: {exc}")
+    if resp.status_code >= 400:
+        snippet = resp.text[:300] if resp.text else ""
+        raise HTTPException(502, f"Apertus HTTP {resp.status_code}: {snippet}")
+    try:
+        data = resp.json()
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception as exc:
+        raise HTTPException(502, f"Réponse Apertus invalide: {exc}")
 
 
 def get_embedder():
@@ -451,6 +595,10 @@ def build_chat_context(course_id: str, hotspot_title: str, hotspot_html: str, al
 
 
 def run_llm_chat(messages: list[dict[str, str]]) -> str:
+    cfg = current_llm_config()
+    provider = cfg["provider"]
+    if provider == "apertus":
+        return chat_completion_apertus(messages, cfg["apertusModel"])
     llm = get_llm()
     out = llm.create_chat_completion(messages=messages, max_tokens=500, temperature=0.2)
     txt = out["choices"][0]["message"]["content"]
@@ -464,6 +612,7 @@ def make_initial_state() -> dict[str, Any]:
         "version": 1,
         "updatedAt": now_ms(),
         "metrics": {"promptsTotal": 0},
+        "llm": default_llm_config(),
         "activeCourseId": course_id,
         "activeWhiteboardId": board_id,
         "courses": [
@@ -499,6 +648,10 @@ def load_state_from_disk() -> dict[str, Any]:
         if "metrics" not in payload or not isinstance(payload.get("metrics"), dict):
             payload["metrics"] = {"promptsTotal": 0}
         payload["metrics"]["promptsTotal"] = int(payload["metrics"].get("promptsTotal", 0))
+        if "llm" not in payload or not isinstance(payload.get("llm"), dict):
+            payload["llm"] = default_llm_config()
+        payload["llm"]["provider"] = normalize_llm_provider(str(payload["llm"].get("provider", default_llm_config()["provider"])))
+        payload["llm"]["apertusModel"] = str(payload["llm"].get("apertusModel", APERTUS_MODEL) or APERTUS_MODEL).strip()
         return payload
     except Exception:
         return make_initial_state()
@@ -693,12 +846,15 @@ async def root() -> FileResponse:
 async def api_bootstrap() -> dict[str, Any]:
     host = detect_local_ip()
     course_id = state.get("activeCourseId", "")
+    llm_cfg = current_llm_config()
     return {
         "state": public_state(),
         "activeBoard": active_board_payload(),
         "shareBaseUrl": f"http://{host}:{PORT}",
         "pdfIndexing": pdf_reindex_state.get(course_id, {"running": False, "error": "", "updatedAt": 0}),
         "chatSupervision": chat_supervision_payload(),
+        "llmProvider": llm_cfg["provider"],
+        "llmConfig": llm_cfg,
     }
 
 
@@ -1147,6 +1303,25 @@ async def chat_queue_status(session_id: str) -> dict[str, Any]:
 async def chat_supervision() -> dict[str, Any]:
     async with chat_lock:
         return chat_supervision_payload()
+
+
+@app.get("/api/llm/config")
+async def llm_config_get() -> dict[str, Any]:
+    async with state_lock:
+        return {"config": current_llm_config()}
+
+
+@app.post("/api/llm/config")
+async def llm_config_set(body: LlmConfigBody) -> dict[str, Any]:
+    async with state_lock:
+        state.setdefault("llm", {})
+        state["llm"]["provider"] = normalize_llm_provider(body.provider)
+        next_model = str(body.apertusModel or APERTUS_MODEL).strip() or APERTUS_MODEL
+        state["llm"]["apertusModel"] = next_model
+        touch_and_save()
+        cfg = current_llm_config()
+    await broadcast({"type": "llm_config", "config": cfg})
+    return {"ok": True, "config": cfg}
 
 
 @app.post("/api/chat/release")

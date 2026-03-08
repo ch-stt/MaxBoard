@@ -400,8 +400,36 @@ body {
   border-radius: 8px;
   padding: 6px 8px;
   font-size: 13px;
-  white-space: pre-wrap;
+  white-space: normal;
   position: relative;
+}
+
+.chat-msg-body {
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.chat-md-inline-code {
+  background: #eef2f8;
+  border: 1px solid #d7dfeb;
+  border-radius: 4px;
+  padding: 0 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.chat-md-code {
+  margin: 6px 0;
+  padding: 8px;
+  border: 1px solid #d7dfeb;
+  border-radius: 8px;
+  background: #f8fafc;
+  overflow: auto;
+}
+
+.chat-md-code code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
 }
 
 .chat-msg.user {

@@ -47,6 +47,7 @@
         <button id="zoom-out-btn" class="btn">-</button>
         <span id="zoom-label" class="pill">100%</span>
         <button id="zoom-in-btn" class="btn">+</button>
+        <button id="llm-config-btn" class="btn">IA: Qwen</button>
         <button id="burger-btn" class="btn">☰</button>
       </div>
     </header>
@@ -184,8 +185,25 @@
       </form>
     </dialog>
 
+    <dialog id="llm-dialog" class="dialog">
+      <h3>Configuration IA</h3>
+      <label>Provider
+        <select id="llm-provider-select">
+          <option value="local">Qwen local</option>
+          <option value="apertus">Apertus</option>
+        </select>
+      </label>
+      <label>Apertus model
+        <input id="llm-apertus-model-input" type="text" />
+      </label>
+      <div class="actions">
+        <button id="llm-save-btn" class="btn primary">Sauver</button>
+        <button id="llm-close-btn" class="btn">Fermer</button>
+      </div>
+    </dialog>
+
     <div id="status" class="status"></div>
     <audio id="bark-audio" preload="auto" src="/assets/max-bark.mp3"></audio>
-    <script src="/assets/app.js"></script>
+    <script src="/assets/app.js?v=20260308-llm-topright-final"></script>
   </body>
   </html>

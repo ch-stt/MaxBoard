@@ -27,6 +27,7 @@
     exportPdfBtn: document.getElementById("export-pdf-btn"),
     exportWbBtn: document.getElementById("export-wb-btn"),
     importWbBtn: document.getElementById("import-wb-btn"),
+    llmConfigBtn: document.getElementById("llm-config-btn"),
     importWbInput: document.getElementById("import-wb-input"),
     resetViewBtn: document.getElementById("reset-view-btn"),
     stage: document.getElementById("board-stage"),
@@ -84,6 +85,11 @@
     supervisionSummary: document.getElementById("supervision-summary"),
     supervisionQueue: document.getElementById("supervision-queue"),
     supervisionActive: document.getElementById("supervision-active"),
+    llmDialog: document.getElementById("llm-dialog"),
+    llmProviderSelect: document.getElementById("llm-provider-select"),
+    llmApertusModelInput: document.getElementById("llm-apertus-model-input"),
+    llmSaveBtn: document.getElementById("llm-save-btn"),
+    llmCloseBtn: document.getElementById("llm-close-btn"),
     barkAudio: document.getElementById("bark-audio"),
     status: document.getElementById("status"),
   };
@@ -132,9 +138,58 @@
       indexing: { running: false, error: "" },
       currentCourseId: "",
     },
+    llm: {
+      provider: "local",
+      apertusModel: "",
+    },
     pinch: null,
     imageCache: {},
   };
+
+  function ensureLlmUi() {
+    const topRight = document.querySelector(".top-right");
+
+    if (!els.llmConfigBtn && topRight) {
+      const btn = document.createElement("button");
+      btn.id = "llm-config-btn";
+      btn.className = "btn";
+      btn.textContent = "IA: Qwen";
+      topRight.insertBefore(btn, els.burgerBtn || null);
+      els.llmConfigBtn = btn;
+    }
+    if (topRight && els.llmConfigBtn && els.llmConfigBtn.parentElement !== topRight) {
+      els.llmConfigBtn.className = "btn";
+      topRight.insertBefore(els.llmConfigBtn, els.burgerBtn || null);
+    }
+
+    if (!els.llmDialog) {
+      const dlg = document.createElement("dialog");
+      dlg.id = "llm-dialog";
+      dlg.className = "dialog";
+      dlg.innerHTML = `
+        <h3>Configuration IA</h3>
+        <label>Provider
+          <select id="llm-provider-select">
+            <option value="local">Qwen local</option>
+            <option value="apertus">Apertus</option>
+          </select>
+        </label>
+        <label>Apertus model
+          <input id="llm-apertus-model-input" type="text" />
+        </label>
+        <div class="actions">
+          <button id="llm-save-btn" class="btn primary">Sauver</button>
+          <button id="llm-close-btn" class="btn">Fermer</button>
+        </div>
+      `;
+      document.body.appendChild(dlg);
+      els.llmDialog = dlg;
+      els.llmProviderSelect = dlg.querySelector("#llm-provider-select");
+      els.llmApertusModelInput = dlg.querySelector("#llm-apertus-model-input");
+      els.llmSaveBtn = dlg.querySelector("#llm-save-btn");
+      els.llmCloseBtn = dlg.querySelector("#llm-close-btn");
+    }
+  }
 
   function setStatus(msg) {
     const roleTxt = isTeacher ? "Prof" : "Consultation";
@@ -161,6 +216,52 @@
     return true;
   }
 
+  function escapeHtml(input) {
+    return String(input || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function safeLinkHref(rawHref) {
+    const href = String(rawHref || "").trim();
+    if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) return href;
+    return "#";
+  }
+
+  function renderMarkdownLite(input) {
+    let text = escapeHtml(input).replace(/\r\n?/g, "\n");
+
+    const blockTokens = [];
+    text = text.replace(/```([\s\S]*?)```/g, (_m, code) => {
+      const token = `@@MD_BLOCK_${blockTokens.length}@@`;
+      blockTokens.push(`<pre class="chat-md-code"><code>${code}</code></pre>`);
+      return token;
+    });
+
+    const inlineTokens = [];
+    text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
+      const token = `@@MD_INLINE_${inlineTokens.length}@@`;
+      inlineTokens.push(`<code class="chat-md-inline-code">${code}</code>`);
+      return token;
+    });
+
+    text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label, href) => {
+      const safeHref = safeLinkHref(href);
+      return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
+    text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    text = text.replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    text = text.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
+    text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+    text = text.replace(/\n/g, "<br>");
+
+    text = text.replace(/@@MD_INLINE_(\d+)@@/g, (_m, i) => inlineTokens[Number(i)] || "");
+    text = text.replace(/@@MD_BLOCK_(\d+)@@/g, (_m, i) => blockTokens[Number(i)] || "");
+    return text;
+  }
+
   function renderChatMessages() {
     const box = els.chatMessages;
     box.innerHTML = "";
@@ -168,7 +269,8 @@
       const el = document.createElement("div");
       el.className = `chat-msg ${m.role === "user" ? "user" : "assistant"}`;
       const body = document.createElement("div");
-      body.textContent = m.content || "";
+      body.className = "chat-msg-body";
+      body.innerHTML = renderMarkdownLite(m.content || "");
       el.appendChild(body);
       if (m.role === "assistant" && Number.isFinite(Number(m.elapsedMs))) {
         const t = document.createElement("div");
@@ -222,6 +324,27 @@
     const aList = (s.active || []).map((x) => `• ${x.name}`).join("\n") || "Aucune session active.";
     els.supervisionQueue.textContent = `File d'attente:\n${qList}`;
     els.supervisionActive.textContent = `Sessions actives:\n${aList}`;
+  }
+
+  function renderLlmConfigDialog() {
+    if (!els.llmProviderSelect || !els.llmApertusModelInput) return;
+    const cfg = state.llm || { provider: "local", apertusModel: "" };
+    const provider = cfg.provider === "apertus" ? "apertus" : "local";
+    els.llmProviderSelect.value = provider;
+    els.llmApertusModelInput.value = cfg.apertusModel || "";
+    updateLlmModelFieldState();
+  }
+
+  function renderLlmProviderButton() {
+    if (!els.llmConfigBtn) return;
+    const provider = state.llm && state.llm.provider === "apertus" ? "Apertus" : "Qwen";
+    els.llmConfigBtn.textContent = `IA: ${provider}`;
+  }
+
+  function updateLlmModelFieldState() {
+    if (!els.llmProviderSelect || !els.llmApertusModelInput) return;
+    const provider = String(els.llmProviderSelect.value || "local");
+    els.llmApertusModelInput.disabled = provider !== "apertus";
   }
 
   function updateChatQueueStatus() {
@@ -645,6 +768,15 @@
         if (els.supervisionDialog.open) renderSupervisionDialog();
         return;
       }
+      if (msg.type === "llm_config" && msg.config) {
+        state.llm = {
+          provider: msg.config.provider === "apertus" ? "apertus" : "local",
+          apertusModel: String(msg.config.apertusModel || ""),
+        };
+        renderLlmProviderButton();
+        if (els.llmDialog.open) renderLlmConfigDialog();
+        return;
+      }
       if (msg.type === "catalog") {
         syncCatalog(msg.state, msg.activeBoard);
         return;
@@ -1057,7 +1189,10 @@
   }
 
   function setTeacherVisibility() {
-    if (isTeacher) return;
+    if (isTeacher) {
+      if (els.llmConfigBtn) els.llmConfigBtn.classList.remove("hidden");
+      return;
+    }
     els.courseBtn.classList.add("hidden");
     els.prevWbBtn.classList.add("hidden");
     els.nextWbBtn.classList.add("hidden");
@@ -1065,11 +1200,13 @@
     els.shareTeacherBtn.classList.add("hidden");
     els.exportWbBtn.classList.add("hidden");
     els.importWbBtn.classList.add("hidden");
+    if (els.llmConfigBtn) els.llmConfigBtn.classList.add("hidden");
     els.coursePdfsBtn.classList.add("hidden");
     els.supervisionChip.classList.add("hidden");
   }
 
   function setupEvents() {
+    ensureLlmUi();
     document.querySelectorAll(".tool").forEach((b) => (b.onclick = () => chooseTool(b.dataset.tool)));
     els.colorInput.oninput = () => {
       state.color = String(els.colorInput.value || "#1a1a1a").toLowerCase();
@@ -1168,6 +1305,38 @@
       els.importWbInput.click();
       els.burgerMenu.classList.add("hidden");
     };
+    if (els.llmProviderSelect) {
+      els.llmProviderSelect.onchange = () => updateLlmModelFieldState();
+    }
+    if (els.llmConfigBtn && els.llmDialog) {
+      els.llmConfigBtn.onclick = () => {
+        renderLlmConfigDialog();
+        els.llmDialog.showModal();
+        els.burgerMenu.classList.add("hidden");
+      };
+    }
+    if (els.llmSaveBtn && els.llmProviderSelect && els.llmApertusModelInput && els.llmDialog) {
+      els.llmSaveBtn.onclick = async () => {
+        const payload = {
+          provider: String(els.llmProviderSelect.value || "local"),
+          apertusModel: String(els.llmApertusModelInput.value || "").trim(),
+        };
+        const res = await api("/api/llm/config", { method: "POST", body: JSON.stringify(payload) });
+        if (res && res.config) {
+          state.llm = {
+            provider: res.config.provider === "apertus" ? "apertus" : "local",
+            apertusModel: String(res.config.apertusModel || ""),
+          };
+        }
+        renderLlmProviderButton();
+        renderLlmConfigDialog();
+        setStatus(`IA: ${state.llm.provider === "apertus" ? "Apertus" : "Qwen local"}`);
+        els.llmDialog.close();
+      };
+    }
+    if (els.llmCloseBtn && els.llmDialog) {
+      els.llmCloseBtn.onclick = () => els.llmDialog.close();
+    }
     els.pdfRefreshBtn.onclick = async () => {
       const c = activeCourse();
       if (!c) return;
@@ -1578,18 +1747,29 @@
   }
 
   async function init() {
+    ensureLlmUi();
     setTeacherVisibility();
     setupEvents();
     const data = await api("/api/bootstrap");
     state.shareBaseUrl = data.shareBaseUrl || location.origin;
     if (data.chatSupervision) state.supervision = data.chatSupervision;
     if (data.pdfIndexing) state.pdfs.indexing = data.pdfIndexing;
+    if (data.llmConfig) {
+      state.llm = {
+        provider: data.llmConfig.provider === "apertus" ? "apertus" : "local",
+        apertusModel: String(data.llmConfig.apertusModel || ""),
+      };
+    } else if (data.llmProvider) {
+      state.llm.provider = data.llmProvider === "apertus" ? "apertus" : "local";
+    }
+    renderLlmProviderButton();
     syncCatalog(data.state, data.activeBoard);
     state.color = String(els.colorInput.value || "#1a1a1a").toLowerCase();
     state.size = Number(els.sizeInput.value || 3);
     refreshPresetColorUI();
     renderSupervisionDialog();
     renderSupervisionChip();
+    renderLlmConfigDialog();
     updateChatQueueStatus();
     resizeCanvas();
     connectWs();
